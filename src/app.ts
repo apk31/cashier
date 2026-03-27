@@ -3,12 +3,12 @@ import express, { Request, Response, NextFunction } from 'express'
 import helmet from 'helmet'
 import cors from 'cors'
 import { validateEnv } from './lib/env'
-import memberRoutes from './routes/member.routes';
-import voucherRoutes from './routes/voucher.routes';
+
 
 // Fail fast if env is misconfigured
 validateEnv()
-
+import memberRoutes from './routes/member.routes';
+import voucherRoutes from './routes/voucher.routes';
 import authRoutes from './routes/auth.routes'
 import productRoutes from './routes/product.routes'
 import categoryRoutes from './routes/category.routes'

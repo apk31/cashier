@@ -4,6 +4,7 @@ import { uuidv7 } from 'uuidv7';
 import { prisma } from '../lib/prisma';
 import { AuthRequest } from '../middlewares/auth.middleware';
 import { logStockChange, StockReason } from '../lib/inventory';
+import { generateReceiptString } from '../lib/receipt';
 
 // ─── Validation schemas ───────────────────────────────────────────────────────
 
@@ -119,16 +120,22 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
         });
       }
 
-      // ── 3. Totals & Payment ───────────────────────────────────────────
+      // ── 3. Validate Member (NEW) ──────────────────────────────────────────
+      if (member_id) {
+        const member = await tx.member.findUnique({ where: { id: member_id } });
+        if (!member) throw new Error(`Member ${member_id} not found`);
+      }
+
+      // ── 4. Totals & Payment ───────────────────────────────────────────
       const total = Math.max(0, subtotal - voucherDiscount);
       const amountPaid = payments.reduce((s, p) => s + p.amount, 0);
 
       if (amountPaid < total) throw new Error(`Underpayment: total is ${total}`);
 
-      // ── 4. Final Creation ──────────────────────────────────────────────
+      // ── 5. Final Creation (MODIFIED) ───────────────────────────────────
       const transaction = await tx.transaction.create({
         data: {
-          id: transactionId, // FIX: Use the pre-generated ID
+          id: transactionId, 
           user_id: userId,
           member_id: member_id ?? null,
           voucher_id: voucherId ?? null,
@@ -147,6 +154,7 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
           },
         },
         include: {
+          user: { select: { name: true } }, // Included so the receipt can print the cashier's name
           items: { include: { variant: { include: { product: true } } } },
           payments: true,
           member: true,
@@ -154,7 +162,7 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
         }
       });
 
-      // ── 5. Loyalty Points ──────────────────────────────────────────────
+      // ── 6. Loyalty Points ──────────────────────────────────────────────
       if (member_id && total >= 1000) {
         await tx.member.update({
           where: { id: member_id },
@@ -162,12 +170,20 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
         });
       }
 
-      return { transaction, change: amountPaid - total };
-    });
+      // ── 7. Generate Dynamic Receipt ────────────────────────────────────
+      const settings = await tx.setting.findUnique({ where: { id: 'GLOBAL' } });
+      const storeInfo = (settings?.store_info as any) || {};
+
+      const receiptString = generateReceiptString(transaction, storeInfo);
+
+      return { transaction, receipt_string: receiptString, change: amountPaid - total };
+    }); // End of Prisma transaction
 
     return res.status(201).json(result);
-  } catch (error: any) {
-    return res.status(400).json({ error: error.message || 'Transaction failed' });
+  } catch (error: unknown) {
+    console.error('[transaction.create]', error);
+    const msg = error instanceof Error ? error.message : 'Transaction failed';
+    return res.status(400).json({ error: msg });
   }
 };
 
