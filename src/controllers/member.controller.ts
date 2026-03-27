@@ -19,3 +19,20 @@ export const getMembers = async (req: Request, res: Response) => {
   const members = await prisma.member.findMany({ orderBy: { points: 'desc' } });
   res.json(members);
 };
+export const getMemberByPhone = async (req: Request, res: Response) => {
+    const phone = Array.isArray(req.params.phone) ? req.params.phone[0] : req.params.phone;
+
+  try {
+    const member = await prisma.member.findUnique({
+      where: { phone }
+    });
+
+    if (!member) {
+      return res.status(404).json({ error: 'Member not found' });
+    }
+
+    return res.json(member);
+  } catch (error) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+};
