@@ -1,64 +1,80 @@
 import { Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import { z } from 'zod';
+import { prisma } from '../lib/prisma';
 
-const prisma = new PrismaClient();
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret';
+const JWT_SECRET = process.env.JWT_SECRET!;
+const JWT_EXPIRES = process.env.JWT_EXPIRES_IN || '12h';
+
+// ─── Validation schemas ───────────────────────────────────────────────────────
+
+const emailLoginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1),
+});
+
+const pinLoginSchema = z.object({
+  username: z.string().min(1),
+  pin: z.string().min(4).max(6),
+});
+
+// ─── Controllers ──────────────────────────────────────────────────────────────
 
 export const login = async (req: Request, res: Response) => {
-
-  if (!req.body) {
-    return res.status(400).json({ error: 'Request body is missing' });
-  }
-
-  const { email, password, pin } = req.body;
+  const { email, password, username, pin } = req.body ?? {};
 
   try {
-    let user;
+    let user: { id: string; name: string; role: string; password: string | null; pin: string | null } | null = null;
 
-    // SCENARIO 1: Cashier Fast Login via PIN
-    if (pin) {
-      // In a real app, you might scope PIN login to a specific terminal/store ID 
-      // or require a username alongside the PIN to prevent PIN collisions.
-      const usersWithPins = await prisma.user.findMany({
-        where: { role: 'CASHIER', pin: { not: null } }
+    // SCENARIO 1: Cashier fast-login via username + PIN (single DB lookup — no loop)
+    if (username && pin) {
+      const parsed = pinLoginSchema.safeParse({ username, pin });
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid PIN login payload', details: parsed.error.flatten() });
+      }
+
+      const found = await prisma.user.findUnique({
+        where: { username },
+        select: { id: true, name: true, role: true, password: true, pin: true },
       });
 
-      for (const u of usersWithPins) {
-        if (await bcrypt.compare(pin, u.pin!)) {
-          user = u;
-          break;
-        }
+      if (found?.pin && (await bcrypt.compare(pin, found.pin))) {
+        user = found;
       }
-    } 
-    // SCENARIO 2: Admin/Manager Login via Email & Password
+    }
+
+    // SCENARIO 2: Admin / Manager login via email + password
     else if (email && password) {
-      user = await prisma.user.findUnique({ where: { email } });
-      if (user && user.password) {
-        const isValid = await bcrypt.compare(password, user.password);
-        if (!isValid) user = null;
+      const parsed = emailLoginSchema.safeParse({ email, password });
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid login payload', details: parsed.error.flatten() });
       }
+
+      const found = await prisma.user.findUnique({
+        where: { email },
+        select: { id: true, name: true, role: true, password: true, pin: true },
+      });
+
+      if (found?.password && (await bcrypt.compare(password, found.password))) {
+        user = found;
+      }
+    } else {
+      return res.status(400).json({ error: 'Provide either (email + password) or (username + pin)' });
     }
 
     if (!user) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Generate JWT
-    const token = jwt.sign(
-      { id: user.id, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '12h' } // 12-hour shift duration
-    );
+    const token = jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES });
 
-    res.json({
-      message: 'Login successful',
+    return res.json({
       token,
-      user: { id: user.id, name: user.name, role: user.role }
+      user: { id: user.id, name: user.name, role: user.role },
     });
-
   } catch (error) {
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('[auth.login]', error);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 };
