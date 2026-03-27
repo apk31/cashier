@@ -7,6 +7,7 @@ import { validateEnv } from './lib/env'
 
 // Fail fast if env is misconfigured
 validateEnv()
+import offlineRoutes from './routes/offline.routes';
 import memberRoutes from './routes/member.routes';
 import voucherRoutes from './routes/voucher.routes';
 import authRoutes from './routes/auth.routes'
@@ -15,6 +16,7 @@ import categoryRoutes from './routes/category.routes'
 import transactionRoutes from './routes/transaction.routes'
 import reportRoutes from './routes/report.routes'
 import inventoryRoutes from './routes/inventory.routes'
+
 
 const app = express()
 
@@ -41,6 +43,7 @@ app.use('/api/reports', reportRoutes)
 app.use('/api/inventory', inventoryRoutes)
 app.use('/api/members', memberRoutes);
 app.use('/api/vouchers', voucherRoutes);
+app.use('/api/offline', offlineRoutes);
 
 // ─── 404 handler ─────────────────────────────────────────────────────────────
 app.use((_req, res) => {
