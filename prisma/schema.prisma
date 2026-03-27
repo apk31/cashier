@@ -8,6 +8,8 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
 enum Role {
   ADMIN
   MANAGER
@@ -33,6 +35,16 @@ enum VoucherType {
   FIXED
 }
 
+enum StockReason {
+  SALE
+  RESTOCK
+  ADJUSTMENT
+  DAMAGE
+  RETURN
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+
 model User {
   id           String        @id @db.Uuid
   email        String?       @unique
@@ -43,6 +55,7 @@ model User {
   role         Role          @default(CASHIER)
   transactions Transaction[]
   price_logs   PriceLog[]
+  stock_logs   StockLog[]
   created_at   DateTime      @default(now())
   updated_at   DateTime      @updatedAt
 
@@ -84,6 +97,7 @@ model Variant {
   product    Product           @relation(fields: [product_id], references: [id])
   price_logs PriceLog[]
   items      TransactionItem[]
+  stock_logs StockLog[]
 
   @@index([product_id])
   @@index([barcode])
@@ -103,6 +117,25 @@ model PriceLog {
   @@index([variant_id])
   @@index([changed_by])
   @@map("price_logs")
+}
+
+model StockLog {
+  id         String      @id @db.Uuid
+  variant_id String      @db.Uuid
+  user_id    String      @db.Uuid
+  old_stock  Int
+  new_stock  Int
+  change     Int         // positive = stock added, negative = stock removed
+  reason     StockReason
+  note       String?
+  created_at DateTime    @default(now())
+  variant    Variant     @relation(fields: [variant_id], references: [id])
+  user       User        @relation(fields: [user_id], references: [id])
+
+  @@index([variant_id])
+  @@index([user_id])
+  @@index([created_at])
+  @@map("stock_logs")
 }
 
 model Transaction {

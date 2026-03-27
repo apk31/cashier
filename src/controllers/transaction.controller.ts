@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { uuidv7 } from 'uuidv7';
 import { prisma } from '../lib/prisma';
 import { AuthRequest } from '../middlewares/auth.middleware';
+import { logStockChange, StockReason } from '../lib/inventory';
 
 // ─── Validation schemas ───────────────────────────────────────────────────────
 
@@ -36,35 +37,57 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
 
   const parsed = createTransactionSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Invalid transaction payload', details: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Invalid payload', details: parsed.error.flatten() });
   }
 
   const { items, payments, member_id, voucher_code, created_at } = parsed.data;
 
   try {
     const result = await prisma.$transaction(async (tx) => {
+      // FIX: Use this single ID for everything
+      const transactionId = uuidv7();
 
-      // ── 1. Validate & resolve items ──────────────────────────────────────
+      // OPTIMIZATION: Fetch all variants in one query to avoid N+1
+      const variantIds = items.map(i => i.variant_id);
+      const variants = await tx.variant.findMany({
+        where: { id: { in: variantIds } }
+      });
+      const variantMap = new Map(variants.map(v => [v.id, v]));
+
       let subtotal = 0;
-      const processedItems: {
-        id: string; variant_id: string; qty: number; price: number; discount: number;
-      }[] = [];
+      const processedItems = [];
 
       for (const item of items) {
-        const variant = await tx.variant.findUnique({ where: { id: item.variant_id } });
+        const variant = variantMap.get(item.variant_id);
 
+        // FIX: Check for null BEFORE accessing properties
         if (!variant) throw new Error(`Variant ${item.variant_id} not found`);
+        
         if (variant.stock < item.quantity) {
-          throw new Error(`Insufficient stock for SKU ${variant.sku} (have ${variant.stock}, need ${item.quantity})`);
+          throw new Error(`Insufficient stock for SKU ${variant.sku}`);
         }
 
+        const oldStock = variant.stock;
+        const newStock = oldStock - item.quantity;
         const lineTotal = Number(variant.price) * item.quantity - item.discount;
         subtotal += lineTotal;
 
+        // Update stock
         await tx.variant.update({
           where: { id: variant.id },
-          data: { stock: { decrement: item.quantity } },
+          data: { stock: newStock },
         });
+
+        // Log stock change using the correct transactionId
+        await logStockChange(
+          tx,
+          variant.id,
+          userId,
+          oldStock,
+          newStock,
+          StockReason.SALE,
+          `Transaction #${transactionId}`
+        );
 
         processedItems.push({
           id: uuidv7(),
@@ -75,56 +98,43 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
         });
       }
 
-      // ── 2. Validate & apply voucher ──────────────────────────────────────
+      // ── 2. Voucher Logic ──────────────────────────────────────────────
       let voucherId: string | undefined;
       let voucherDiscount = 0;
 
       if (voucher_code) {
-        const now = new Date();
         const voucher = await tx.voucher.findUnique({ where: { code: voucher_code } });
-
-        if (!voucher) throw new Error(`Voucher code "${voucher_code}" not found`);
-        if (voucher.exp < now) throw new Error(`Voucher "${voucher_code}" has expired`);
-        if (voucher.used_count >= voucher.max_uses) throw new Error(`Voucher "${voucher_code}" has reached its usage limit`);
+        if (!voucher) throw new Error(`Voucher "${voucher_code}" not found`);
+        if (new Date(voucher.exp) < new Date()) throw new Error("Voucher expired");
+        if (voucher.used_count >= voucher.max_uses) throw new Error("Voucher limit reached");
 
         voucherId = voucher.id;
-        voucherDiscount =
-          voucher.type === 'PERCENTAGE'
-            ? subtotal * (Number(voucher.value) / 100)
-            : Number(voucher.value);
+        voucherDiscount = voucher.type === 'PERCENTAGE' 
+          ? subtotal * (Number(voucher.value) / 100) 
+          : Number(voucher.value);
 
         await tx.voucher.update({
           where: { id: voucher.id },
-          data: { used_count: { increment: 1 } },
+          data: { used_count: { increment: 1 } }
         });
       }
 
-      // ── 3. Validate member ───────────────────────────────────────────────
-      if (member_id) {
-        const member = await tx.member.findUnique({ where: { id: member_id } });
-        if (!member) throw new Error(`Member ${member_id} not found`);
-      }
-
-      // ── 4. Validate payments sum covers total ────────────────────────────
-      const discountTotal = voucherDiscount;
-      const total = Math.max(0, subtotal - discountTotal);
+      // ── 3. Totals & Payment ───────────────────────────────────────────
+      const total = Math.max(0, subtotal - voucherDiscount);
       const amountPaid = payments.reduce((s, p) => s + p.amount, 0);
 
-      if (amountPaid < total) {
-        throw new Error(`Underpayment: total is ${total}, but only ${amountPaid} paid`);
-      }
+      if (amountPaid < total) throw new Error(`Underpayment: total is ${total}`);
 
-      // ── 5. Create transaction ────────────────────────────────────────────
+      // ── 4. Final Creation ──────────────────────────────────────────────
       const transaction = await tx.transaction.create({
         data: {
-          id: uuidv7(),
+          id: transactionId, // FIX: Use the pre-generated ID
           user_id: userId,
           member_id: member_id ?? null,
           voucher_id: voucherId ?? null,
           subtotal,
-          discount_total: discountTotal,
+          discount_total: voucherDiscount,
           total,
-          // Allow offline timestamp override
           ...(created_at ? { created_at: new Date(created_at) } : {}),
           items: { create: processedItems },
           payments: {
@@ -139,20 +149,17 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
         include: {
           items: { include: { variant: { include: { product: true } } } },
           payments: true,
-          member: { select: { name: true, phone: true, tier: true } },
-          voucher: { select: { code: true, type: true, value: true } },
-        },
+          member: true,
+          voucher: true,
+        }
       });
 
-      // ── 6. Award member loyalty points (1 point per 1000 Rp) ─────────────
-      if (member_id) {
-        const pointsEarned = Math.floor(total / 1000);
-        if (pointsEarned > 0) {
-          await tx.member.update({
-            where: { id: member_id },
-            data: { points: { increment: pointsEarned } },
-          });
-        }
+      // ── 5. Loyalty Points ──────────────────────────────────────────────
+      if (member_id && total >= 1000) {
+        await tx.member.update({
+          where: { id: member_id },
+          data: { points: { increment: Math.floor(total / 1000) } }
+        });
       }
 
       return { transaction, change: amountPaid - total };
@@ -160,18 +167,14 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
 
     return res.status(201).json(result);
   } catch (error: any) {
-    console.error('[transaction.create]', error);
-    const isClientError = [
-      'not found', 'Insufficient stock', 'Voucher', 'Underpayment', 'Member',
-    ].some((msg) => error.message?.includes(msg));
-    return res.status(isClientError ? 400 : 500).json({ error: error.message || 'Transaction failed' });
+    return res.status(400).json({ error: error.message || 'Transaction failed' });
   }
 };
 
 // ─── Get single transaction ───────────────────────────────────────────────────
 
 export const getTransaction = async (req: AuthRequest, res: Response) => {
-  // const { id } = req.params;
+  // const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;;
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
 
   try {
