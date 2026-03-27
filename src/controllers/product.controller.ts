@@ -59,7 +59,8 @@ export const getProducts = async (req: Request, res: Response) => {
 
 // Fast barcode / SKU lookup for cashier scanner
 export const getProductByBarcode = async (req: Request, res: Response) => {
-  const { code } = req.params;
+  const code = Array.isArray(req.params.code) ? req.params.code[0] : req.params.code;
+  // const { code } = req.params;
   try {
     const variant = await prisma.variant.findFirst({
       where: { OR: [{ barcode: code }, { sku: code }] },
@@ -117,7 +118,8 @@ export const createProduct = async (req: Request, res: Response) => {
 };
 
 export const updateProduct = async (req: AuthRequest, res: Response) => {
-  const { id } = req.params;
+  // const { id } = req.params;
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const parsed = updateProductSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: 'Invalid payload', details: parsed.error.flatten() });
@@ -139,7 +141,8 @@ export const updateProduct = async (req: AuthRequest, res: Response) => {
 
 // Update price for a variant — logs the change
 export const updateVariantPrice = async (req: AuthRequest, res: Response) => {
-  const { id } = req.params; // variant id
+  // const { id } = req.params; // variant id
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const userId = req.user!.id;
 
   const parsed = z.object({ price: z.number().positive() }).safeParse(req.body);
@@ -175,7 +178,8 @@ export const updateVariantPrice = async (req: AuthRequest, res: Response) => {
 
 // Update stock for a variant
 export const updateVariantStock = async (req: AuthRequest, res: Response) => {
-  const { id } = req.params;
+  // const { id } = req.params;
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
   const parsed = z.object({ stock: z.number().int().min(0) }).safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: 'Invalid payload', details: parsed.error.flatten() });

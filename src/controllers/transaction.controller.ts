@@ -171,7 +171,9 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
 // ─── Get single transaction ───────────────────────────────────────────────────
 
 export const getTransaction = async (req: AuthRequest, res: Response) => {
-  const { id } = req.params;
+  // const { id } = req.params;
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
   try {
     const tx = await prisma.transaction.findUnique({
       where: { id },

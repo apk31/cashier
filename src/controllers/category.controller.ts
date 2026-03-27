@@ -42,7 +42,9 @@ export const createCategory = async (req: Request, res: Response) => {
 };
 
 export const deleteCategory = async (req: Request, res: Response) => {
-  const { id } = req.params;
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  // const { id } = req.params;
   try {
     await prisma.category.delete({ where: { id } });
     return res.status(204).send();
