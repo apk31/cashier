@@ -203,3 +203,40 @@ export const getPriceChangeLogs = async (req: Request, res: Response) => {
     return res.status(500).json({ error: 'Failed to fetch price logs' });
   }
 };
+
+// ─── Low stock alerts ─────────────────────────────────────────────────────────
+
+export const getLowStockAlerts = async (req: Request, res: Response) => {
+  // Default threshold is 10, but the frontend can request a custom one (e.g., ?threshold=5)
+  const threshold = Number(req.query.threshold) || 10;
+
+  try {
+    const lowStockItems = await prisma.variant.findMany({
+      where: {
+        stock: { lte: threshold }
+      },
+      include: {
+        product: {
+          select: { name: true, category: { select: { name: true } } }
+        }
+      },
+      orderBy: { stock: 'asc' } // Show lowest stock first
+    });
+
+    return res.json({
+      alert_threshold: threshold,
+      total_alerts: lowStockItems.length,
+      items: lowStockItems.map(item => ({
+        variant_id: item.id,
+        product_name: item.product.name,
+        category: item.product.category.name,
+        sku: item.sku,
+        current_stock: item.stock,
+        price: item.price
+      }))
+    });
+  } catch (error) {
+    console.error('[report.lowStock]', error);
+    return res.status(500).json({ error: 'Failed to fetch low stock alerts' });
+  }
+};

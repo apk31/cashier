@@ -3,6 +3,8 @@ import express, { Request, Response, NextFunction } from 'express'
 import helmet from 'helmet'
 import cors from 'cors'
 import { validateEnv } from './lib/env'
+import memberRoutes from './routes/member.routes';
+import voucherRoutes from './routes/voucher.routes';
 
 // Fail fast if env is misconfigured
 validateEnv()
@@ -37,6 +39,8 @@ app.use('/api/categories', categoryRoutes)
 app.use('/api/transactions', transactionRoutes)
 app.use('/api/reports', reportRoutes)
 app.use('/api/inventory', inventoryRoutes)
+app.use('/api/members', memberRoutes);
+app.use('/api/vouchers', voucherRoutes);
 
 // ─── 404 handler ─────────────────────────────────────────────────────────────
 app.use((_req, res) => {
