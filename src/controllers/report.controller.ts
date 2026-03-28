@@ -68,8 +68,8 @@ export const getSalesSummary = async (req: Request, res: Response) => {
       // Hourly breakdown for today (useful for busy-hour analysis)
       prisma.$queryRaw<{ hour: number; revenue: number; count: number }[]>`
         SELECT EXTRACT(HOUR FROM created_at)::int AS hour,
-               SUM(total)::numeric AS revenue,
-               COUNT(*) AS count
+               SUM(total)::float8 AS revenue,
+               COUNT(*)::int AS count
         FROM transactions
         WHERE created_at >= ${from} AND created_at < ${to}
         GROUP BY hour
@@ -140,8 +140,8 @@ export const getMonthlyReport = async (req: Request, res: Response) => {
       // Daily totals — used for the Laporan Penjualan Harian table
       prisma.$queryRaw<{ day: string; revenue: number; count: number }[]>`
         SELECT DATE(created_at) AS day,
-               SUM(total)::numeric AS revenue,
-               COUNT(*) AS count
+               SUM(total)::float8 AS revenue,
+               COUNT(*)::int AS count
         FROM transactions
         WHERE created_at >= ${from} AND created_at < ${to}
         GROUP BY day
