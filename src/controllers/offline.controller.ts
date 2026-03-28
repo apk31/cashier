@@ -1,26 +1,79 @@
 import { Request, Response } from 'express';
+import { z } from 'zod';
 import { uuidv7 } from 'uuidv7';
 import { prisma } from '../lib/prisma';
 import { logStockChange, StockReason } from '../lib/inventory';
 import { AuthRequest } from '../middlewares/auth.middleware';
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface OfflineTransactionPayload {
+  created_at: string;
+  voucher_code?: string;
+  member_id?: string | null;
+  user_id?: string;
+  items: Array<{
+    variant_id: string;
+    quantity: number;
+    discount: number;
+    price?: number;
+  }>;
+  payments: Array<{
+    method: string;
+    amount: number;
+    ref_no?: string;
+  }>;
+}
+
+// ─── Validation schemas ───────────────────────────────────────────────────────
+
+const offlineItemSchema = z.object({
+  variant_id: z.string().uuid(),
+  quantity: z.number().int().positive(),
+  discount: z.number().min(0).default(0),
+  price: z.number().min(0).optional(),
+});
+
+const offlinePaymentSchema = z.object({
+  method: z.enum(['CASH', 'QRIS', 'TRANSFER']),
+  amount: z.number().positive(),
+  ref_no: z.string().optional(),
+});
+
+const offlineTxSchema = z.object({
+  created_at: z.string().datetime(),
+  voucher_code: z.string().optional(),
+  member_id: z.string().uuid().optional().nullable(),
+  user_id: z.string().uuid().optional(),
+  items: z.array(offlineItemSchema).min(1),
+  payments: z.array(offlinePaymentSchema).min(1),
+});
+
+const syncSchema = z.object({
+  transactions: z.array(offlineTxSchema).min(1),
+});
+
 // ─── 1. Bulk Sync Endpoint ────────────────────────────────────────────────────
+
 export const syncTransactions = async (req: AuthRequest, res: Response) => {
   const userId = req.user?.id;
   if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-  const { transactions } = req.body; // Array of pending transactions from PWA
-  if (!Array.isArray(transactions)) return res.status(400).json({ error: 'Expected array of transactions' });
+  const parsed = syncSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid sync payload', details: parsed.error.flatten() });
+  }
 
+  const { transactions } = parsed.data;
   const results = { successful: 0, failed: 0, queued: 0 };
-  const now = new Date().getTime();
+  const now = Date.now();
   const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
   for (const txData of transactions) {
     const txTime = new Date(txData.created_at).getTime();
     const timeDrift = now - txTime;
 
-    // RULE 3: The 6-Hour Lockout
+    // RULE 1: The 6-Hour Lockout
     if (timeDrift > SIX_HOURS_MS) {
       await saveToQueue(txData, 'STALE_TRANSACTION', 'Transaction is older than 6 hours limit');
       results.queued++;
@@ -34,12 +87,13 @@ export const syncTransactions = async (req: AuthRequest, res: Response) => {
       continue;
     }
 
-    // RULE 1: Attempt execution, queue if failed (e.g., Stock out)
+    // RULE 3: Attempt execution, queue if failed (e.g., stock out)
     try {
       await executeTransactionCore(userId, txData);
       results.successful++;
-    } catch (error: any) {
-      await saveToQueue(txData, 'EXECUTION_FAILED', error.message || 'Unknown database error');
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : 'Unknown database error';
+      await saveToQueue(txData, 'EXECUTION_FAILED', msg);
       results.failed++;
     }
   }
@@ -50,7 +104,7 @@ export const syncTransactions = async (req: AuthRequest, res: Response) => {
 // ─── 2. Manager Endpoints for the Danger Zone ─────────────────────────────────
 
 // Get all failed/stale transactions needing review
-export const getOfflineQueue = async (req: Request, res: Response) => {
+export const getOfflineQueue = async (_req: Request, res: Response) => {
   try {
     const queue = await prisma.offlineQueue.findMany({
       where: { synced_at: null },
@@ -58,6 +112,7 @@ export const getOfflineQueue = async (req: Request, res: Response) => {
     });
     return res.json(queue);
   } catch (error) {
+    console.error('[offline.getQueue]', error);
     return res.status(500).json({ error: 'Failed to fetch queue' });
   }
 };
@@ -68,12 +123,13 @@ export const discardQueueItem = async (req: Request, res: Response) => {
   try {
     await prisma.offlineQueue.delete({ where: { id } });
     return res.json({ message: 'Item discarded' });
-  } catch (error) {
+  } catch (error: unknown) {
+    const e = error as { code?: string };
+    if (e.code === 'P2025') return res.status(404).json({ error: 'Queue item not found' });
+    console.error('[offline.discard]', error);
     return res.status(500).json({ error: 'Failed to discard item' });
   }
 };
-
-// Add this near your other exports in src/controllers/offline.controller.ts
 
 export const retryQueueItem = async (req: AuthRequest, res: Response) => {
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -82,53 +138,55 @@ export const retryQueueItem = async (req: AuthRequest, res: Response) => {
     const queuedItem = await prisma.offlineQueue.findUnique({ where: { id } });
     if (!queuedItem) return res.status(404).json({ error: 'Queue item not found' });
 
-    const payload = queuedItem.payload as any;
-    // Use the original cashier's ID if available in the payload, otherwise default to the Manager resolving it
-    const executorId = payload.user_id || req.user?.id;
+    const payload = queuedItem.payload as unknown as OfflineTransactionPayload;
+    // Use the original cashier's ID if available in the payload, otherwise use the Manager resolving it
+    const executorId = payload.user_id ?? req.user?.id;
+    if (!executorId) return res.status(400).json({ error: 'No valid user ID to execute transaction' });
 
-    if (!executorId) throw new Error("No valid user ID to execute transaction");
-
-    // Attempt to run the transaction again
     await executeTransactionCore(executorId, payload);
 
-    // If it reaches here, it succeeded! Remove it from the Danger Zone queue.
+    // Success — remove from Danger Zone
     await prisma.offlineQueue.delete({ where: { id } });
-
     return res.json({ message: 'Transaction successfully recovered and synced' });
 
-  } catch (error: any) {
-    // If it fails AGAIN (e.g., they still didn't add enough stock), update the error log
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : 'Unknown error';
+    // Update the error log and leave it in queue for next attempt
     await prisma.offlineQueue.update({
       where: { id },
-      data: { error: `[RETRY_FAILED] ${error.message || 'Unknown error'}` }
+      data: { error: `[RETRY_FAILED] ${msg}` }
     });
-
-    return res.status(400).json({ error: error.message || 'Retry failed' });
+    return res.status(400).json({ error: msg });
   }
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// Saves failed syncs to the DB for manager review
-async function saveToQueue(payload: any, errorType: string, details: string) {
+async function saveToQueue(payload: OfflineTransactionPayload, errorType: string, details: string) {
   await prisma.offlineQueue.create({
     data: {
       id: uuidv7(),
-      payload: payload,
+      payload: payload as object,
       error: `[${errorType}] ${details}`
     }
   });
 }
 
-// The core transaction logic (extracted so both live and offline can use it safely)
-async function executeTransactionCore(userId: string, data: any) {
+// Core transaction logic — shared by live sync and retry endpoints
+async function executeTransactionCore(userId: string, data: OfflineTransactionPayload) {
   return await prisma.$transaction(async (tx) => {
     const transactionId = uuidv7();
     let subtotal = 0;
-    const processedItems = [];
+    const processedItems: Array<{
+      id: string;
+      variant_id: string;
+      qty: number;
+      price: number;
+      discount: number;
+    }> = [];
 
-    // Fetch variants
-    const variantIds = data.items.map((i: any) => i.variant_id);
+    // Batch-fetch all variants to avoid N+1
+    const variantIds = data.items.map(i => i.variant_id);
     const variants = await tx.variant.findMany({ where: { id: { in: variantIds } } });
     const variantMap = new Map(variants.map(v => [v.id, v]));
 
@@ -142,6 +200,7 @@ async function executeTransactionCore(userId: string, data: any) {
       const oldStock = variant.stock;
       const newStock = oldStock - item.quantity;
 
+      // Open-price logic: respect cashier-entered price only for flagged variants
       const unitPrice = variant.has_open_price && item.price !== undefined
         ? item.price
         : Number(variant.price);
@@ -150,7 +209,6 @@ async function executeTransactionCore(userId: string, data: any) {
       subtotal += lineTotal;
 
       await tx.variant.update({ where: { id: variant.id }, data: { stock: newStock } });
-
       await logStockChange(tx, variant.id, userId, oldStock, newStock, StockReason.SALE, `Sync Trx #${transactionId}`);
 
       processedItems.push({
@@ -163,7 +221,7 @@ async function executeTransactionCore(userId: string, data: any) {
     }
 
     const total = Math.max(0, subtotal); // Offline has no vouchers, so subtotal = total
-    const amountPaid = data.payments.reduce((s: number, p: any) => s + p.amount, 0);
+    const amountPaid = data.payments.reduce((s, p) => s + p.amount, 0);
     if (amountPaid < total) throw new Error(`Underpayment: total is ${total}`);
 
     await tx.transaction.create({
@@ -173,13 +231,14 @@ async function executeTransactionCore(userId: string, data: any) {
         member_id: data.member_id ?? null,
         subtotal,
         total,
-        created_at: new Date(data.created_at), // Accurate to the offline moment
+        created_at: new Date(data.created_at),
         items: { create: processedItems },
         payments: {
-          create: data.payments.map((p: any) => ({
+          create: data.payments.map(p => ({
             id: uuidv7(),
-            method: p.method,
+            method: p.method as 'CASH' | 'QRIS' | 'TRANSFER',
             amount: p.amount,
+            ref_no: p.ref_no ?? null,
           })),
         },
       }

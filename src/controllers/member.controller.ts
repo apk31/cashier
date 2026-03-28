@@ -26,8 +26,10 @@ export const createMember = async (req: Request, res: Response) => {
       data: { id: uuidv7(), name, phone }
     });
     return res.status(201).json(member);
-  } catch (error: any) {
-    if (error.code === 'P2002') return res.status(409).json({ error: 'Phone number already registered' });
+  } catch (error: unknown) {
+    const e = error as { code?: string };
+    if (e.code === 'P2002') return res.status(409).json({ error: 'Phone number already registered' });
+    console.error('[member.create]', error);
     return res.status(500).json({ error: 'Failed to create member' });
   }
 };
@@ -78,7 +80,7 @@ export const updateMember = async (req: Request, res: Response) => {
   const { name, phone } = parsed.data;
 
   try {
-    const dataToUpdate: any = {};
+    const dataToUpdate: Record<string, string> = {};
     if (name) dataToUpdate.name = name;
     if (phone) dataToUpdate.phone = phone;
 
@@ -87,9 +89,10 @@ export const updateMember = async (req: Request, res: Response) => {
       data: dataToUpdate,
     });
     return res.json(member);
-  } catch (error: any) {
-    if (error.code === 'P2025') return res.status(404).json({ error: 'Member not found' });
-    if (error.code === 'P2002') return res.status(409).json({ error: 'Phone number already registered to another member' });
+  } catch (error: unknown) {
+    const e = error as { code?: string };
+    if (e.code === 'P2025') return res.status(404).json({ error: 'Member not found' });
+    if (e.code === 'P2002') return res.status(409).json({ error: 'Phone number already registered to another member' });
     console.error('[member.update]', error);
     return res.status(500).json({ error: 'Failed to update member' });
   }

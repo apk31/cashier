@@ -2,6 +2,7 @@ import { Response } from 'express';
 import { z } from 'zod';
 import { uuidv7 } from 'uuidv7';
 import { prisma } from '../lib/prisma';
+import { Prisma } from '@prisma/client';
 import { AuthRequest } from '../middlewares/auth.middleware';
 import { logStockChange, StockReason } from '../lib/inventory';
 import { generateReceiptString } from '../lib/receipt';
@@ -188,9 +189,16 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
 
     return res.status(201).json(result);
   } catch (error: unknown) {
-    console.error('[transaction.create]', error);
     const msg = error instanceof Error ? error.message : 'Transaction failed';
-    return res.status(400).json({ error: msg });
+    // Known business-logic errors thrown inside the tx block are client errors (400)
+    const clientErrors = [
+      'not found', 'Insufficient stock', 'Underpayment',
+      'expired', 'limit reached', 'offline mode'
+    ];
+    const isClientError = clientErrors.some(s => msg.toLowerCase().includes(s.toLowerCase()));
+    if (isClientError) return res.status(400).json({ error: msg });
+    console.error('[transaction.create]', error);
+    return res.status(500).json({ error: 'Transaction failed due to an internal error' });
   }
 };
 
@@ -227,12 +235,12 @@ export const getTransactions = async (req: AuthRequest, res: Response) => {
   const take = Math.min(parseInt(limit) || 50, 200);
   const skip = (Math.max(parseInt(page) || 1, 1) - 1) * take;
 
-  const whereOptions: any = {};
-  
+  const whereOptions: Prisma.TransactionWhereInput = {};
+
   if (from || to) {
     whereOptions.created_at = {};
-    if (from) whereOptions.created_at.gte = new Date(from);
-    if (to) whereOptions.created_at.lt = new Date(to);
+    if (from) (whereOptions.created_at as Prisma.DateTimeFilter).gte = new Date(from);
+    if (to) (whereOptions.created_at as Prisma.DateTimeFilter).lt = new Date(to);
   }
 
   try {

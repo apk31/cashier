@@ -3,6 +3,7 @@ import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
 import { z } from 'zod'
 import { prisma } from '../lib/prisma'
+import { AuthRequest } from '../middlewares/auth.middleware'
 
 const JWT_SECRET = process.env.JWT_SECRET!
 const JWT_EXPIRES = process.env.JWT_EXPIRES_IN || '12h'
@@ -87,9 +88,8 @@ export const login = async (req: Request, res: Response) => {
   }
 }
 
-export const getMe = async (req: Request, res: Response) => {
-  // We have to cast to our custom AuthRequest since we didn't type it at the route level
-  const userId = (req as any).user?.id
+export const getMe = async (req: AuthRequest, res: Response) => {
+  const userId = req.user?.id
   if (!userId) return res.status(401).json({ error: 'Unauthorized' })
 
   try {
@@ -97,7 +97,7 @@ export const getMe = async (req: Request, res: Response) => {
       where: { id: userId },
       select: { id: true, name: true, role: true, email: true, username: true }
     })
-    
+
     if (!user) return res.status(404).json({ error: 'User not found' })
     return res.json(user)
   } catch (error) {

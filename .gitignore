@@ -12,5 +12,5 @@
 .env.test
 .env.production
 *.zip
-/prisma/migrations
-*.md
+# prisma/migrations — MUST be committed for production deploys
+# *.md — project docs should be committed
