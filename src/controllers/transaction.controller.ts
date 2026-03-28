@@ -19,6 +19,7 @@ const itemSchema = z.object({
   variant_id: z.string().uuid(),
   quantity: z.number().int().positive(),
   discount: z.number().min(0).default(0), // per-item fixed discount in Rp
+  price: z.number().min(0).optional(), // for open-price items today
 });
 
 const createTransactionSchema = z.object({
@@ -70,7 +71,13 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
 
         const oldStock = variant.stock;
         const newStock = oldStock - item.quantity;
-        const lineTotal = Number(variant.price) * item.quantity - item.discount;
+
+        // Open Price Logic: use client price if item fluctuates, else strict DB price
+        const unitPrice = variant.has_open_price && item.price !== undefined 
+          ? item.price 
+          : Number(variant.price);
+
+        const lineTotal = unitPrice * item.quantity - item.discount;
         subtotal += lineTotal;
 
         // Update stock
@@ -94,7 +101,7 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
           id: uuidv7(),
           variant_id: variant.id,
           qty: item.quantity,
-          price: Number(variant.price),
+          price: unitPrice,
           discount: item.discount,
         });
       }
@@ -209,5 +216,43 @@ export const getTransaction = async (req: AuthRequest, res: Response) => {
   } catch (error) {
     console.error('[transaction.get]', error);
     return res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// ─── Get all transactions (paginated) ─────────────────────────────────────────
+
+export const getTransactions = async (req: AuthRequest, res: Response) => {
+  const { page = '1', limit = '50', from, to } = req.query as Record<string, string>;
+  
+  const take = Math.min(parseInt(limit) || 50, 200);
+  const skip = (Math.max(parseInt(page) || 1, 1) - 1) * take;
+
+  const whereOptions: any = {};
+  
+  if (from || to) {
+    whereOptions.created_at = {};
+    if (from) whereOptions.created_at.gte = new Date(from);
+    if (to) whereOptions.created_at.lt = new Date(to);
+  }
+
+  try {
+    const [transactions, total] = await Promise.all([
+      prisma.transaction.findMany({
+        where: whereOptions,
+        include: {
+          user: { select: { name: true } },
+          member: { select: { name: true } },
+        },
+        orderBy: { created_at: 'desc' },
+        take,
+        skip,
+      }),
+      prisma.transaction.count({ where: whereOptions }),
+    ]);
+
+    return res.json({ data: transactions, total, page: parseInt(page), limit: take });
+  } catch (error) {
+    console.error('[transaction.getAll]', error);
+    return res.status(500).json({ error: 'Failed to fetch transactions' });
   }
 };

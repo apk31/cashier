@@ -68,7 +68,7 @@ export const generateReceiptString = (transaction: any, storeInfo: StoreInfo = {
   lines.push(separator());
   lines.push('');
 
-  if (transaction.discount_total > 0) {
+  if (Number(transaction.discount_total) > 0) {
     lines.push(justify('SUBTOTAL', formatRp(transaction.subtotal)));
     lines.push(justify('VOUCHER', `-${formatRp(transaction.discount_total)}`));
   }

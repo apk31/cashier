@@ -77,7 +77,7 @@ export const discardQueueItem = async (req: Request, res: Response) => {
 
 export const retryQueueItem = async (req: AuthRequest, res: Response) => {
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-  
+
   try {
     const queuedItem = await prisma.offlineQueue.findUnique({ where: { id } });
     if (!queuedItem) return res.status(404).json({ error: 'Queue item not found' });
@@ -95,14 +95,14 @@ export const retryQueueItem = async (req: AuthRequest, res: Response) => {
     await prisma.offlineQueue.delete({ where: { id } });
 
     return res.json({ message: 'Transaction successfully recovered and synced' });
-    
+
   } catch (error: any) {
     // If it fails AGAIN (e.g., they still didn't add enough stock), update the error log
     await prisma.offlineQueue.update({
       where: { id },
       data: { error: `[RETRY_FAILED] ${error.message || 'Unknown error'}` }
     });
-    
+
     return res.status(400).json({ error: error.message || 'Retry failed' });
   }
 };
@@ -141,7 +141,12 @@ async function executeTransactionCore(userId: string, data: any) {
 
       const oldStock = variant.stock;
       const newStock = oldStock - item.quantity;
-      const lineTotal = Number(variant.price) * item.quantity - item.discount;
+
+      const unitPrice = variant.has_open_price && item.price !== undefined
+        ? item.price
+        : Number(variant.price);
+
+      const lineTotal = unitPrice * item.quantity - item.discount;
       subtotal += lineTotal;
 
       await tx.variant.update({ where: { id: variant.id }, data: { stock: newStock } });
@@ -152,7 +157,7 @@ async function executeTransactionCore(userId: string, data: any) {
         id: uuidv7(),
         variant_id: variant.id,
         qty: item.quantity,
-        price: Number(variant.price),
+        price: unitPrice,
         discount: item.discount,
       });
     }

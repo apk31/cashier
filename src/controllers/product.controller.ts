@@ -13,6 +13,7 @@ const variantSchema = z.object({
   barcode: z.string().optional(),
   price: z.number().positive(),
   stock: z.number().int().min(0).default(0),
+  has_open_price: z.boolean().default(false),
 })
 
 const createProductSchema = z.object({
@@ -108,6 +109,7 @@ export const createProduct = async (req: AuthRequest, res: Response) => {
               barcode: v.barcode ?? null,
               price: v.price,
               stock: v.stock,
+              has_open_price: v.has_open_price,
             },
           })
 
@@ -220,6 +222,8 @@ export const updateVariantStock = async (req: AuthRequest, res: Response) => {
       const oldStock = variant.stock
       const newStock = oldStock + quantity
 
+      if (newStock < 0) throw new Error(`Stock cannot go negative. Current stock: ${oldStock}`)
+
       const updated = await tx.variant.update({
         where: { id },
         data: { stock: newStock },
@@ -234,7 +238,171 @@ export const updateVariantStock = async (req: AuthRequest, res: Response) => {
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : ''
     if (msg === 'Variant not found') return res.status(404).json({ error: 'Variant not found' })
+    if (msg.startsWith('Stock cannot go negative')) return res.status(400).json({ error: msg })
     console.error('[product.updateStock]', error)
     return res.status(500).json({ error: 'Failed to update stock' })
   }
 }
+
+export const deleteProduct = async (req: AuthRequest, res: Response) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  try {
+    await prisma.product.delete({ where: { id } })
+    return res.status(204).send()
+  } catch (error: unknown) {
+    const e = error as { code?: string }
+    if (e.code === 'P2025') return res.status(404).json({ error: 'Product not found' })
+    if (e.code === 'P2003') return res.status(409).json({ error: 'Cannot delete product with existing transaction history' })
+    console.error('[product.delete]', error)
+    return res.status(500).json({ error: 'Failed to delete product' })
+  }
+}
+
+// ─── Bulk Operations ──────────────────────────────────────────────────────────
+
+const bulkItemSchema = z.object({
+  category_name: z.string().min(1),
+  product_name: z.string().min(1),
+  variant_name: z.string().optional().nullable(),
+  sku: z.string().min(1),
+  barcode: z.string().optional().nullable(),
+  price: z.number().min(0),
+  stock: z.number().int().min(0).default(0),
+  has_open_price: z.boolean().default(false),
+});
+
+const bulkApplySchema = z.array(bulkItemSchema).min(1);
+
+export const exportProductsBulk = async (req: AuthRequest, res: Response) => {
+  try {
+    const variants = await prisma.variant.findMany({
+      include: {
+        product: {
+          include: { category: true }
+        }
+      },
+      orderBy: [
+        { product: { category: { name: 'asc' } } },
+        { product: { name: 'asc' } },
+        { sku: 'asc' }
+      ]
+    });
+
+    const flatData = variants.map(v => ({
+      category_name: v.product.category.name,
+      product_name: v.product.name,
+      variant_name: v.name || '',
+      sku: v.sku,
+      barcode: v.barcode || '',
+      price: Number(v.price),
+      stock: v.stock,
+      has_open_price: v.has_open_price
+    }));
+
+    return res.json({ data: flatData });
+  } catch (error) {
+    console.error('[product.bulkExport]', error);
+    return res.status(500).json({ error: 'Failed to export products' });
+  }
+};
+
+export const applyProductsBulk = async (req: AuthRequest, res: Response) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  const parsed = bulkApplySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid payload', details: parsed.error.flatten() });
+  }
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      let createdCount = 0;
+      let updatedCount = 0;
+
+      for (const row of parsed.data) {
+        // 1. Resolve/Upsert Category
+        let category = await tx.category.findFirst({ where: { name: row.category_name } });
+        if (!category) {
+          category = await tx.category.create({
+            data: { id: uuidv7(), name: row.category_name }
+          });
+        }
+
+        // 2. Resolve/Upsert Product
+        let product = await tx.product.findFirst({ 
+          where: { name: row.product_name, category_id: category.id } 
+        });
+        if (!product) {
+          product = await tx.product.create({
+            data: { id: uuidv7(), name: row.product_name, category_id: category.id }
+          });
+        }
+
+        // 3. Resolve/Upsert Variant
+        const existingVariant = await tx.variant.findUnique({ where: { sku: row.sku } });
+
+        if (!existingVariant) {
+          // CREATE
+          const newVariant = await tx.variant.create({
+            data: {
+              id: uuidv7(),
+              product_id: product.id,
+              name: row.variant_name || null,
+              sku: row.sku,
+              barcode: row.barcode || null,
+              price: row.price,
+              stock: row.stock,
+              has_open_price: row.has_open_price
+            }
+          });
+          
+          if (row.stock > 0) {
+            await logStockChange(tx, newVariant.id, userId, 0, row.stock, StockReason.RESTOCK, 'Bulk Import Creation');
+          }
+          createdCount++;
+        } else {
+          // UPDATE
+          const oldStock = existingVariant.stock;
+          const oldPrice = Number(existingVariant.price);
+          const needsPriceLog = oldPrice !== row.price;
+          const needsStockLog = oldStock !== row.stock;
+
+          await tx.variant.update({
+            where: { id: existingVariant.id },
+            data: {
+              product_id: product.id,
+              name: row.variant_name || null,
+              barcode: row.barcode || null,
+              price: row.price,
+              stock: row.stock,
+              has_open_price: row.has_open_price
+            }
+          });
+
+          if (needsPriceLog) {
+            await tx.priceLog.create({
+               data: { id: uuidv7(), variant_id: existingVariant.id, old_price: oldPrice, new_price: row.price, changed_by: userId }
+            });
+          }
+
+          if (needsStockLog) {
+            await logStockChange(tx, existingVariant.id, userId, oldStock, row.stock, StockReason.ADJUSTMENT, 'Bulk Import Update');
+          }
+
+          updatedCount++;
+        }
+      }
+
+      return { success: true, processed: parsed.data.length, created: createdCount, updated: updatedCount };
+    });
+
+    return res.json(result);
+  } catch (error: any) {
+    console.error('[product.bulkApply]', error);
+    // Best effort error msg for uniqueness constraints (e.g. duplicate barcode)
+    if (error.code === 'P2002') return res.status(409).json({ error: 'Bulk import failed due to duplicate SKU or Barcode in your data.' });
+    return res.status(500).json({ error: 'Bulk import transaction failed' });
+  }
+};

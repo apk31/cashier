@@ -16,6 +16,8 @@ import categoryRoutes from './routes/category.routes'
 import transactionRoutes from './routes/transaction.routes'
 import reportRoutes from './routes/report.routes'
 import inventoryRoutes from './routes/inventory.routes'
+import settingsRoutes from './routes/settings.routes'
+import userRoutes from './routes/user.routes'
 
 
 const app = express()
@@ -44,6 +46,8 @@ app.use('/api/inventory', inventoryRoutes)
 app.use('/api/members', memberRoutes);
 app.use('/api/vouchers', voucherRoutes);
 app.use('/api/offline', offlineRoutes);
+app.use('/api/settings', settingsRoutes);
+app.use('/api/users', userRoutes);
 
 // ─── 404 handler ─────────────────────────────────────────────────────────────
 app.use((_req, res) => {

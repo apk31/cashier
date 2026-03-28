@@ -6,8 +6,12 @@
     "moduleResolution": "node",
     "ignoreDeprecations": "6.0",
     "target": "es2020",
-    "lib": ["es2020"],
-    "types": ["node"],
+    "lib": [
+      "es2020"
+    ],
+    "types": [
+      "node"
+    ],
     "sourceMap": true,
     "declaration": true,
     "strict": true,
@@ -16,6 +20,12 @@
     "resolveJsonModule": true,
     "isolatedModules": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "prisma"]
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "prisma"
+  ]
 }

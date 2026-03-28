@@ -8,6 +8,11 @@ const memberSchema = z.object({
   phone: z.string().min(8).max(15)
 });
 
+const updateMemberSchema = z.object({
+  name: z.string().min(1).optional(),
+  phone: z.string().min(8).max(15).optional(),
+});
+
 export const createMember = async (req: Request, res: Response) => {
   const parsed = memberSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -60,5 +65,32 @@ export const getMemberByPhone = async (req: Request, res: Response) => {
     return res.json(member);
   } catch (error) {
     return res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+export const updateMember = async (req: Request, res: Response) => {
+  const parsed = updateMemberSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid payload', details: parsed.error.flatten() });
+  }
+
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const { name, phone } = parsed.data;
+
+  try {
+    const dataToUpdate: any = {};
+    if (name) dataToUpdate.name = name;
+    if (phone) dataToUpdate.phone = phone;
+
+    const member = await prisma.member.update({
+      where: { id },
+      data: dataToUpdate,
+    });
+    return res.json(member);
+  } catch (error: any) {
+    if (error.code === 'P2025') return res.status(404).json({ error: 'Member not found' });
+    if (error.code === 'P2002') return res.status(409).json({ error: 'Phone number already registered to another member' });
+    console.error('[member.update]', error);
+    return res.status(500).json({ error: 'Failed to update member' });
   }
 };
