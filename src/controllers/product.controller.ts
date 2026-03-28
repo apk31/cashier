@@ -11,7 +11,7 @@ const variantSchema = z.object({
   name: z.string().optional(),
   sku: z.string().min(1),
   barcode: z.string().optional(),
-  price: z.number().positive(),
+  price: z.number().min(0),
   stock: z.number().int().min(0).default(0),
   base_price: z.number().min(0).optional().default(0),
   has_open_price: z.boolean().default(false),
@@ -19,13 +19,13 @@ const variantSchema = z.object({
 
 const createProductSchema = z.object({
   name: z.string().min(1),
-  category_id: z.string().uuid(),
+  category_id: z.string().min(1),
   variants: z.array(variantSchema).min(1),
 })
 
 const updateProductSchema = z.object({
   name: z.string().min(1).optional(),
-  category_id: z.string().uuid().optional(),
+  category_id: z.string().min(1).optional(),
 })
 
 const updateStockSchema = z.object({
@@ -52,7 +52,17 @@ export const getProducts = async (req: AuthRequest, res: Response) => {
     const [products, total] = await Promise.all([
       prisma.product.findMany({
         where,
-        include: { category: true, variants: true },
+        include: { 
+      category: true, 
+      variants: {
+        include: {
+          stock_batches: {
+            where: { remaining_qty: { gt: 0 } }, // Only send batches that still have stock
+            orderBy: { created_at: 'asc' } // Oldest first (FIFO)
+          }
+        }
+      } 
+    },
         orderBy: { name: 'asc' },
         take,
         skip,
