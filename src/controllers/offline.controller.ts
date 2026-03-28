@@ -28,23 +28,23 @@ interface OfflineTransactionPayload {
 // ─── Validation schemas ───────────────────────────────────────────────────────
 
 const offlineItemSchema = z.object({
-  variant_id: z.string().uuid(),
-  quantity: z.number().int().positive(),
-  discount: z.number().min(0).default(0),
-  price: z.number().min(0).optional(),
+  variant_id: z.string(),
+  quantity: z.coerce.number().int().positive(),
+  discount: z.coerce.number().min(0).default(0),
+  price: z.coerce.number().min(0).optional(),
 });
 
 const offlinePaymentSchema = z.object({
   method: z.enum(['CASH', 'QRIS', 'TRANSFER']),
-  amount: z.number().positive(),
+  amount: z.coerce.number().positive(),
   ref_no: z.string().optional(),
 });
 
 const offlineTxSchema = z.object({
   created_at: z.string().datetime(),
   voucher_code: z.string().optional(),
-  member_id: z.string().uuid().optional().nullable(),
-  user_id: z.string().uuid().optional(),
+  member_id: z.string().optional().nullable(),
+  user_id: z.string().optional(),
   items: z.array(offlineItemSchema).min(1),
   payments: z.array(offlinePaymentSchema).min(1),
 });
@@ -183,6 +183,7 @@ async function executeTransactionCore(userId: string, data: OfflineTransactionPa
       qty: number;
       price: number;
       discount: number;
+      cogs_total: number;
     }> = [];
 
     // Batch-fetch all variants to avoid N+1
@@ -208,6 +209,28 @@ async function executeTransactionCore(userId: string, data: OfflineTransactionPa
       const lineTotal = unitPrice * item.quantity - item.discount;
       subtotal += lineTotal;
 
+      // ── FIFO StockBatch Calculation ──
+      const batches = await tx.stockBatch.findMany({
+        where: { variant_id: variant.id, remaining_qty: { gt: 0 } },
+        orderBy: { created_at: 'asc' }
+      });
+
+      let qtyNeeded = item.quantity;
+      let cogsTotal = 0;
+
+      for (const batch of batches) {
+         if (qtyNeeded <= 0) break;
+         const qtyToTake = Math.min(batch.remaining_qty, qtyNeeded);
+         
+         cogsTotal += qtyToTake * Number(batch.base_price);
+         qtyNeeded -= qtyToTake;
+
+         await tx.stockBatch.update({
+           where: { id: batch.id },
+           data: { remaining_qty: batch.remaining_qty - qtyToTake }
+         });
+      }
+
       await tx.variant.update({ where: { id: variant.id }, data: { stock: newStock } });
       await logStockChange(tx, variant.id, userId, oldStock, newStock, StockReason.SALE, `Sync Trx #${transactionId}`);
 
@@ -217,6 +240,7 @@ async function executeTransactionCore(userId: string, data: OfflineTransactionPa
         qty: item.quantity,
         price: unitPrice,
         discount: item.discount,
+        cogs_total: cogsTotal,
       });
     }
 

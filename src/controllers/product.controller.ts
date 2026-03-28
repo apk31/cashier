@@ -13,6 +13,7 @@ const variantSchema = z.object({
   barcode: z.string().optional(),
   price: z.number().positive(),
   stock: z.number().int().min(0).default(0),
+  base_price: z.number().min(0).optional().default(0),
   has_open_price: z.boolean().default(false),
 })
 
@@ -29,6 +30,7 @@ const updateProductSchema = z.object({
 
 const updateStockSchema = z.object({
   quantity: z.number().int({ message: 'quantity must be an integer' }),
+  base_price: z.number().min(0).optional().default(0),
   reason: z.nativeEnum(StockReason).optional().default(StockReason.ADJUSTMENT),
   note: z.string().max(255).optional(),
 })
@@ -113,8 +115,17 @@ export const createProduct = async (req: AuthRequest, res: Response) => {
             },
           })
 
-          // Log initial stock so the audit trail has no gaps
+          // Log initial stock and create batch so the audit trail has no gaps
           if (v.stock > 0) {
+            await tx.stockBatch.create({
+              data: {
+                id: uuidv7(),
+                variant_id: variant.id,
+                initial_qty: v.stock,
+                remaining_qty: v.stock,
+                base_price: v.base_price,
+              }
+            });
             await logStockChange(
               tx, variant.id, userId,
               0, v.stock,
@@ -224,6 +235,35 @@ export const updateVariantStock = async (req: AuthRequest, res: Response) => {
 
       if (newStock < 0) throw new Error(`Stock cannot go negative. Current stock: ${oldStock}`)
 
+      if (quantity > 0) {
+        // Add new shipment to FIFO queue
+        await tx.stockBatch.create({
+          data: {
+            id: uuidv7(),
+            variant_id: id,
+            initial_qty: quantity,
+            remaining_qty: quantity,
+            base_price: parsed.data.base_price,
+          }
+        });
+      } else if (quantity < 0) {
+        // Remove from oldest FIFO queue
+        const batches = await tx.stockBatch.findMany({
+          where: { variant_id: id, remaining_qty: { gt: 0 } },
+          orderBy: { created_at: 'asc' }
+        });
+        let qtyToDrop = Math.abs(quantity);
+        for (const batch of batches) {
+           if (qtyToDrop <= 0) break;
+           const taking = Math.min(batch.remaining_qty, qtyToDrop);
+           qtyToDrop -= taking;
+           await tx.stockBatch.update({
+             where: { id: batch.id },
+             data: { remaining_qty: batch.remaining_qty - taking }
+           });
+        }
+      }
+
       const updated = await tx.variant.update({
         where: { id },
         data: { stock: newStock },
@@ -269,6 +309,7 @@ const bulkItemSchema = z.object({
   barcode: z.string().optional().nullable(),
   price: z.number().min(0),
   stock: z.number().int().min(0).default(0),
+  base_price: z.number().min(0).optional().default(0),
   has_open_price: z.boolean().default(false),
 });
 
@@ -297,6 +338,7 @@ export const exportProductsBulk = async (req: AuthRequest, res: Response) => {
       barcode: v.barcode || '',
       price: Number(v.price),
       stock: v.stock,
+      base_price: 0,
       has_open_price: v.has_open_price
     }));
 
@@ -388,6 +430,27 @@ export const applyProductsBulk = async (req: AuthRequest, res: Response) => {
           }
 
           if (needsStockLog) {
+            const diff = row.stock - oldStock;
+            if (diff > 0) {
+               await tx.stockBatch.create({
+                 data: { id: uuidv7(), variant_id: existingVariant.id, initial_qty: diff, remaining_qty: diff, base_price: row.base_price }
+               });
+            } else if (diff < 0) {
+               const batches = await tx.stockBatch.findMany({
+                 where: { variant_id: existingVariant.id, remaining_qty: { gt: 0 } },
+                 orderBy: { created_at: 'asc' }
+               });
+               let qtyToDrop = Math.abs(diff);
+               for (const batch of batches) {
+                  if (qtyToDrop <= 0) break;
+                  const taking = Math.min(batch.remaining_qty, qtyToDrop);
+                  qtyToDrop -= taking;
+                  await tx.stockBatch.update({
+                    where: { id: batch.id },
+                    data: { remaining_qty: batch.remaining_qty - taking }
+                  });
+               }
+            }
             await logStockChange(tx, existingVariant.id, userId, oldStock, row.stock, StockReason.ADJUSTMENT, 'Bulk Import Update');
           }
 

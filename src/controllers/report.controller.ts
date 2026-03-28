@@ -33,12 +33,18 @@ export const getSalesSummary = async (req: Request, res: Response) => {
   try {
     const where = { created_at: { gte: from, lt: to } };
 
-    const [salesSummary, paymentBreakdown, topVariants, hourlyBreakdown] = await Promise.all([
+    const [salesSummary, cogsSummary, paymentBreakdown, topVariants, hourlyBreakdown] = await Promise.all([
       // Total revenue, count, discount
       prisma.transaction.aggregate({
         _sum: { total: true, subtotal: true, discount_total: true },
         _count: { id: true },
         where,
+      }),
+
+      // COGS from items
+      prisma.transactionItem.aggregate({
+        _sum: { cogs_total: true },
+        where: { transaction: where },
       }),
 
       // Revenue by payment method
@@ -95,6 +101,8 @@ export const getSalesSummary = async (req: Request, res: Response) => {
         subtotal: salesSummary._sum.subtotal ?? 0,
         discount_total: salesSummary._sum.discount_total ?? 0,
         transaction_count: salesSummary._count.id,
+        cogs_total: cogsSummary._sum.cogs_total ?? 0,
+        gross_profit: Number(salesSummary._sum.total ?? 0) - Number(cogsSummary._sum.cogs_total ?? 0),
       },
       payment_breakdown: paymentBreakdown,
       top_items: topItems,
@@ -117,11 +125,16 @@ export const getMonthlyReport = async (req: Request, res: Response) => {
   const to = new Date(y, m, 1);
 
   try {
-    const [summary, dailyBreakdown, paymentBreakdown] = await Promise.all([
+    const [summary, cogsSummary, dailyBreakdown, paymentBreakdown] = await Promise.all([
       prisma.transaction.aggregate({
         _sum: { total: true, subtotal: true, discount_total: true },
         _count: { id: true },
         where: { created_at: { gte: from, lt: to } },
+      }),
+
+      prisma.transactionItem.aggregate({
+        _sum: { cogs_total: true },
+        where: { transaction: { created_at: { gte: from, lt: to } } },
       }),
 
       // Daily totals — used for the Laporan Penjualan Harian table
@@ -160,6 +173,8 @@ export const getMonthlyReport = async (req: Request, res: Response) => {
         discount_total: Number(summary._sum.discount_total ?? 0),
         transaction_count: summary._count.id,
         dpp: taxConfig?.is_pkp ? revenue - ppnAmount : revenue, // Dasar Pengenaan Pajak
+        cogs_total: Number(cogsSummary._sum.cogs_total ?? 0),
+        gross_profit: revenue - Number(cogsSummary._sum.cogs_total ?? 0),
       },
       daily_breakdown: dailyBreakdown,
       payment_breakdown: paymentBreakdown,
@@ -238,5 +253,91 @@ export const getLowStockAlerts = async (req: Request, res: Response) => {
   } catch (error) {
     console.error('[report.lowStock]', error);
     return res.status(500).json({ error: 'Failed to fetch low stock alerts' });
+  }
+};
+
+// ─── E-Statement / Ledger ──────────────────────────────────────────────────────
+
+export const getEStatement = async (req: Request, res: Response) => {
+  const { from, to } = getDateRange(req.query as Record<string, string>);
+
+  try {
+    // 1. Fetch Sales Transactions for timeline
+    const sales = await prisma.transaction.findMany({
+      where: { created_at: { gte: from, lt: to } },
+      include: { items: true },
+      orderBy: { created_at: 'asc' }
+    });
+
+    // 2. Fetch Restocks/StockBatches for timeline
+    const restocks = await prisma.stockBatch.findMany({
+      where: { created_at: { gte: from, lt: to } },
+      include: { variant: { include: { product: true } } },
+      orderBy: { created_at: 'asc' }
+    });
+
+    // We can merge them into a standard ledger format
+    const ledger = [];
+
+    let totalSalesRevenue = 0;
+    let totalCogs = 0;
+    let totalPurchases = 0;
+
+    for (const s of sales) {
+      const cogs = s.items.reduce((sum, item) => sum + Number(item.cogs_total), 0);
+      const rev = Number(s.total);
+      
+      totalSalesRevenue += rev;
+      totalCogs += cogs;
+
+      ledger.push({
+        date: s.created_at.toISOString(),
+        type: 'SALE',
+        ref_id: s.id,
+        description: `Sales Transaction`,
+        debit: rev,     // Money in from sale
+        credit: cogs,   // COGS represented here as an asset credit, but e-statement formats usually vary.
+        profit: rev - cogs,
+      });
+    }
+
+    for (const r of restocks) {
+      const value = r.initial_qty * Number(r.base_price);
+      totalPurchases += value;
+
+      ledger.push({
+        date: r.created_at.toISOString(),
+        type: 'RESTOCK',
+        ref_id: r.id,
+        description: `Restock: ${r.variant.product.name} ${r.variant.name ? `(${r.variant.name})` : ''}`,
+        debit: 0,
+        credit: value, // Money out to buy stock
+        profit: null,
+      });
+    }
+
+    // Sort ledger by date true chronological
+    ledger.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+    // 3. Current Inventory Valuation (Global Asset Value)
+    const allBatches = await prisma.stockBatch.findMany({
+      where: { remaining_qty: { gt: 0 } }
+    });
+    const currentValuation = allBatches.reduce((sum, b) => sum + (b.remaining_qty * Number(b.base_price)), 0);
+
+    return res.json({
+      period: { from: from.toISOString(), to: to.toISOString() },
+      ledger,
+      summary: {
+        total_sales_revenue: totalSalesRevenue,
+        total_cogs: totalCogs,
+        gross_profit: totalSalesRevenue - totalCogs,
+        total_purchases_spent: totalPurchases,
+        current_inventory_valuation: currentValuation
+      }
+    });
+  } catch (error) {
+    console.error('[report.estatement]', error);
+    return res.status(500).json({ error: 'Failed to generate e-statement' });
   }
 };

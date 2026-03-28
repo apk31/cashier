@@ -81,7 +81,30 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
         const lineTotal = unitPrice * item.quantity - item.discount;
         subtotal += lineTotal;
 
-        // Update stock
+        // ── FIFO StockBatch Calculation ──
+        const batches = await tx.stockBatch.findMany({
+          where: { variant_id: variant.id, remaining_qty: { gt: 0 } },
+          orderBy: { created_at: 'asc' }
+        });
+
+        let qtyNeeded = item.quantity;
+        let cogsTotal = 0;
+
+        for (const batch of batches) {
+           if (qtyNeeded <= 0) break;
+           const qtyToTake = Math.min(batch.remaining_qty, qtyNeeded);
+           
+           cogsTotal += qtyToTake * Number(batch.base_price);
+           qtyNeeded -= qtyToTake;
+
+           await tx.stockBatch.update({
+             where: { id: batch.id },
+             data: { remaining_qty: batch.remaining_qty - qtyToTake }
+           });
+        }
+        
+        // If qtyNeeded > 0, we sell without a cost base
+        // Update total stock integer
         await tx.variant.update({
           where: { id: variant.id },
           data: { stock: newStock },
@@ -104,6 +127,7 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
           qty: item.quantity,
           price: unitPrice,
           discount: item.discount,
+          cogs_total: cogsTotal,
         });
       }
 
