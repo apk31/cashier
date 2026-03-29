@@ -5,6 +5,48 @@ import { prisma } from '../lib/prisma'
 import { AuthRequest } from '../middlewares/auth.middleware'
 import { logStockChange, StockReason } from '../lib/inventory'
 
+// ─── NEW: updateVariantMeta ───────────────────────────────────────────────────
+// Drop this into product.controller.ts alongside the other exports.
+// It handles PATCH /api/products/variants/:id for non-financial metadata:
+//   • variant display name
+//   • has_open_price flag
+// Price → use updateVariantPrice (keeps audit log)
+// Stock → use updateVariantStock (keeps FIFO batches)
+
+const updateVariantMetaSchema = z.object({
+  name: z.string().nullable().optional(),
+  has_open_price: z.boolean().optional(),
+});
+
+export const updateVariantMeta = async (req: AuthRequest, res: Response) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  const parsed = updateVariantMetaSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Invalid payload', details: parsed.error.flatten() });
+  }
+
+  // Build only the fields that were actually sent
+  const data: { name?: string | null; has_open_price?: boolean } = {};
+  if (parsed.data.name !== undefined) data.name = parsed.data.name;
+  if (parsed.data.has_open_price !== undefined) data.has_open_price = parsed.data.has_open_price;
+
+  if (Object.keys(data).length === 0) {
+    return res.status(400).json({ error: 'No fields to update' });
+  }
+
+  try {
+    const variant = await prisma.variant.update({ where: { id }, data });
+    return res.json(variant);
+  } catch (error: unknown) {
+    const e = error as { code?: string };
+    if (e.code === 'P2025') return res.status(404).json({ error: 'Variant not found' });
+    console.error('[product.updateVariantMeta]', error);
+    return res.status(500).json({ error: 'Failed to update variant' });
+  }
+};
+
+
 // ─── Validation schemas ───────────────────────────────────────────────────────
 
 const variantSchema = z.object({
