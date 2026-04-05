@@ -47,14 +47,39 @@ async function main() {
     },
   });
 
-  // 3. Settings
+  // 3. Settings — Indonesian UMKM tax configuration
   await prisma.setting.upsert({
     where: { id: 'GLOBAL' },
-    update: {},
+    update: {
+      tax_config: {
+        tax_status: 'FREE',
+        pph_rate: 0.5,
+        ppn_rate: 11,
+        pb1_rate: 10,
+        service_charge_rate: 5,
+        apply_ppn_to_sales: false,
+        apply_pb1_to_sales: false,
+        npwp: '12.345.678.9-012.000',
+      },
+    },
     create: {
       id: 'GLOBAL',
-      store_info: { name: 'Penguin Walk Coffee', address: 'Jl. Kopi No. 1, Malang', phone: '08123456789', footer: 'Thank you for visiting!' },
-      tax_config: { is_pkp: true, npwp: '12.345.678.9-012.000', ppn_rate: 11 },
+      store_info: {
+        name: 'Penguin Walk Coffee',
+        address: 'Jl. Kopi No. 1, Malang',
+        phone: '08123456789',
+        footer: 'Thank you for visiting!',
+      },
+      tax_config: {
+        tax_status: 'FREE',
+        pph_rate: 0.5,
+        ppn_rate: 11,
+        pb1_rate: 10,
+        service_charge_rate: 5,
+        apply_ppn_to_sales: false,
+        apply_pb1_to_sales: false,
+        npwp: '12.345.678.9-012.000',
+      },
       printer_config: { connection: 'USB', paper_width: 58 },
     },
   });
@@ -108,11 +133,11 @@ async function main() {
     data: { id: uuidv7(), variant_id: varCroissantId, initial_qty: 20, remaining_qty: 20, base_price: 9000 } // Today's batch, price went up! HPP 9k
   });
 
-  // 5. Sample Transactions
+  // 5. Sample Transaction (status: PAID — the default)
   const trxId = uuidv7();
   await prisma.transaction.create({
     data: {
-      id: trxId, user_id: cashierId, subtotal: 45000, discount_total: 0, total: 45000,
+      id: trxId, user_id: cashierId, status: 'PAID', subtotal: 45000, discount_total: 0, tax_amount: 0, service_charge_amount: 0, total: 45000,
       items: {
         create: [
           { id: uuidv7(), variant_id: varLatteRegId, qty: 1, price: 25000, discount: 0, cogs_total: 12000 },
@@ -123,6 +148,29 @@ async function main() {
         create: [{ id: uuidv7(), method: 'QRIS', amount: 45000 }]
       }
     }
+  });
+
+  // 6. Sample Cash Shift
+  const shiftId = uuidv7();
+  await prisma.cashShift.create({
+    data: {
+      id: shiftId,
+      user_id: cashierId,
+      starting_cash: 200000,
+      status: 'OPEN',
+    },
+  });
+
+  // 7. Sample Expense
+  await prisma.expense.create({
+    data: {
+      id: uuidv7(),
+      user_id: adminId,
+      store_id: 'GLOBAL',
+      amount: 150000,
+      category: 'Supplies',
+      description: 'Coffee beans restock from local supplier',
+    },
   });
 
   console.log('✅ Seed complete. Run `npm run dev` in backend.');

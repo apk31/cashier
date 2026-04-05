@@ -3,7 +3,6 @@ import { Decimal } from '@prisma/client/runtime/library';
 
 const LINE_WIDTH = 32;
 
-// Add this interface to define the store data shape
 export interface StoreInfo {
   name?: string;
   address?: string;
@@ -36,11 +35,15 @@ const justify = (left: string, rightStr: string): string => {
 
 const separator = (char = '-') => char.repeat(LINE_WIDTH);
 
-// Update signature to accept storeInfo
-export const generateReceiptString = (transaction: any, storeInfo: StoreInfo = {}): string => {
+export const generateReceiptString = (
+  transaction: any,
+  storeInfo: StoreInfo = {},
+  taxAmount: number = 0,
+  serviceChargeAmount: number = 0
+): string => {
   const lines: string[] = [];
 
-  // Use dynamic store info or fallbacks
+  // Header
   lines.push(center(storeInfo.name || 'STORE NAME'));
   if (storeInfo.address) lines.push(center(storeInfo.address));
   if (storeInfo.phone) lines.push(center(storeInfo.phone));
@@ -50,6 +53,12 @@ export const generateReceiptString = (transaction: any, storeInfo: StoreInfo = {
   lines.push(`Trx: #${transaction.id.substring(0, 8).toUpperCase()}`);
   lines.push(`Date: ${format(transaction.created_at, 'dd/MM/yyyy HH:mm')}`);
   lines.push(`Cashier: ${transaction.user?.name || 'Unknown'}`);
+
+  // Show status badge for non-PAID transactions
+  if (transaction.status && transaction.status !== 'PAID') {
+    lines.push(`Status: ** ${transaction.status} **`);
+  }
+
   lines.push(separator());
   lines.push('');
 
@@ -72,7 +81,15 @@ export const generateReceiptString = (transaction: any, storeInfo: StoreInfo = {
     lines.push(justify('SUBTOTAL', formatRp(transaction.subtotal)));
     lines.push(justify('VOUCHER', `-${formatRp(transaction.discount_total)}`));
   }
-  
+
+  // Tax line items (consumer-facing)
+  if (taxAmount > 0) {
+    lines.push(justify('TAX', formatRp(taxAmount)));
+  }
+  if (serviceChargeAmount > 0) {
+    lines.push(justify('SERVICE CHARGE', formatRp(serviceChargeAmount)));
+  }
+
   lines.push(justify('TOTAL', formatRp(transaction.total)));
   lines.push('');
   lines.push(separator());
@@ -96,7 +113,7 @@ export const generateReceiptString = (transaction: any, storeInfo: StoreInfo = {
     lines.push('');
   }
 
-  // Use dynamic footer
+  // Note: PPh Final 0.5% is NEVER shown on customer receipt — it's a business expense
   lines.push(center(storeInfo.footer || 'Thank You for Visiting!'));
   lines.push('');
   lines.push('');

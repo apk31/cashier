@@ -43,6 +43,19 @@ enum StockReason {
   RETURN
 }
 
+enum OrderStatus {
+  OPEN
+  PAID
+  VOIDED
+  QUOTATION
+  INVOICE
+}
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
 // ─── Models ───────────────────────────────────────────────────────────────────
 
 model User {
@@ -56,6 +69,8 @@ model User {
   transactions Transaction[]
   price_logs   PriceLog[]
   stock_logs   StockLog[]
+  expenses     Expense[]
+  shifts       CashShift[]
   created_at   DateTime      @default(now())
   updated_at   DateTime      @updatedAt
 
@@ -155,23 +170,31 @@ model StockBatch {
 }
 
 model Transaction {
-  id             String            @id @db.Uuid
-  user_id        String            @db.Uuid
-  member_id      String?           @db.Uuid
-  voucher_id     String?           @db.Uuid
-  subtotal       Decimal           @db.Decimal(12, 2)
-  discount_total Decimal           @default(0) @db.Decimal(12, 2)
-  total          Decimal           @db.Decimal(12, 2)
-  created_at     DateTime          @default(now())
-  user           User              @relation(fields: [user_id], references: [id])
-  member         Member?           @relation(fields: [member_id], references: [id])
-  voucher        Voucher?          @relation(fields: [voucher_id], references: [id])
-  items          TransactionItem[]
-  payments       Payment[]
+  id                    String            @id @db.Uuid
+  user_id               String            @db.Uuid
+  member_id             String?           @db.Uuid
+  voucher_id            String?           @db.Uuid
+  shift_id              String?           @db.Uuid
+  status                OrderStatus       @default(PAID)
+  table_id              String?
+  subtotal              Decimal           @db.Decimal(12, 2)
+  discount_total        Decimal           @default(0) @db.Decimal(12, 2)
+  tax_amount            Decimal           @default(0) @db.Decimal(12, 2)
+  service_charge_amount Decimal           @default(0) @db.Decimal(12, 2)
+  total                 Decimal           @db.Decimal(12, 2)
+  created_at            DateTime          @default(now())
+  user                  User              @relation(fields: [user_id], references: [id])
+  member                Member?           @relation(fields: [member_id], references: [id])
+  voucher               Voucher?          @relation(fields: [voucher_id], references: [id])
+  shift                 CashShift?        @relation(fields: [shift_id], references: [id])
+  items                 TransactionItem[]
+  payments              Payment[]
 
   @@index([user_id])
   @@index([member_id])
+  @@index([shift_id])
   @@index([created_at])
+  @@index([status])
   @@map("transactions")
 }
 
@@ -249,3 +272,43 @@ model Setting {
 
   @@map("settings")
 }
+
+// ─── Business Operations ──────────────────────────────────────────────────────
+
+model Expense {
+  id          String   @id @db.Uuid
+  store_id    String   @default("GLOBAL")
+  user_id     String   @db.Uuid
+  amount      Decimal  @db.Decimal(12, 2)
+  category    String
+  description String?
+  receipt_url String?
+  created_at  DateTime @default(now())
+  user        User     @relation(fields: [user_id], references: [id])
+
+  @@index([user_id])
+  @@index([store_id])
+  @@index([created_at])
+  @@index([category])
+  @@map("expenses")
+}
+
+model CashShift {
+  id            String        @id @db.Uuid
+  user_id       String        @db.Uuid
+  opened_at     DateTime      @default(now())
+  closed_at     DateTime?
+  starting_cash Decimal       @db.Decimal(12, 2)
+  expected_cash Decimal       @default(0) @db.Decimal(12, 2)
+  actual_cash   Decimal       @default(0) @db.Decimal(12, 2)
+  difference    Decimal       @default(0) @db.Decimal(12, 2)
+  status        ShiftStatus   @default(OPEN)
+  user          User          @relation(fields: [user_id], references: [id])
+  transactions  Transaction[]
+
+  @@index([user_id])
+  @@index([status])
+  @@index([opened_at])
+  @@map("cash_shifts")
+}
+

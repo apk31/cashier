@@ -18,6 +18,8 @@ import reportRoutes from './routes/report.routes'
 import inventoryRoutes from './routes/inventory.routes'
 import settingsRoutes from './routes/settings.routes'
 import userRoutes from './routes/user.routes'
+import shiftRoutes from './routes/shift.routes'
+import expenseRoutes from './routes/expense.routes'
 
 
 const app = express()
@@ -61,6 +63,8 @@ app.use('/api/vouchers', voucherRoutes);
 app.use('/api/offline', offlineRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/shifts', shiftRoutes);
+app.use('/api/expenses', expenseRoutes);
 
 // ─── 404 handler ─────────────────────────────────────────────────────────────
 app.use((_req, res) => {

@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../lib/prisma';
+import { parseTaxConfig } from './settings.controller';
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
 
@@ -20,6 +21,9 @@ function getDateRange(query: Record<string, string>) {
   return { from, to };
 }
 
+/** UMKM threshold — first Rp 500M of the year is tax-free for PPh Final */
+const UMKM_TAX_FREE_LIMIT = 500_000_000;
+
 // ─── Daily / range sales summary ─────────────────────────────────────────────
 
 export const getSalesSummary = async (req: Request, res: Response) => {
@@ -31,23 +35,20 @@ export const getSalesSummary = async (req: Request, res: Response) => {
   const { from, to } = getDateRange(req.query as Record<string, string>);
 
   try {
-    const where = { created_at: { gte: from, lt: to } };
+    const where = { created_at: { gte: from, lt: to }, status: 'PAID' as const };
 
     const [salesSummary, cogsSummary, paymentBreakdown, topVariants, hourlyBreakdown] = await Promise.all([
-      // Total revenue, count, discount
       prisma.transaction.aggregate({
-        _sum: { total: true, subtotal: true, discount_total: true },
+        _sum: { total: true, subtotal: true, discount_total: true, tax_amount: true, service_charge_amount: true },
         _count: { id: true },
         where,
       }),
 
-      // COGS from items
       prisma.transactionItem.aggregate({
         _sum: { cogs_total: true },
         where: { transaction: where },
       }),
 
-      // Revenue by payment method
       prisma.payment.groupBy({
         by: ['method'],
         _sum: { amount: true },
@@ -55,7 +56,6 @@ export const getSalesSummary = async (req: Request, res: Response) => {
         where: { transaction: where },
       }),
 
-      // Top 10 selling variants with names resolved
       prisma.transactionItem.groupBy({
         by: ['variant_id'],
         _sum: { qty: true },
@@ -65,13 +65,12 @@ export const getSalesSummary = async (req: Request, res: Response) => {
         take: 10,
       }),
 
-      // Hourly breakdown for today (useful for busy-hour analysis)
       prisma.$queryRaw<{ hour: number; revenue: number; count: number }[]>`
         SELECT EXTRACT(HOUR FROM created_at)::int AS hour,
                SUM(total)::float8 AS revenue,
                COUNT(*)::int AS count
         FROM transactions
-        WHERE created_at >= ${from} AND created_at < ${to}
+        WHERE created_at >= ${from} AND created_at < ${to} AND status = 'PAID'
         GROUP BY hour
         ORDER BY hour
       `,
@@ -100,6 +99,8 @@ export const getSalesSummary = async (req: Request, res: Response) => {
         revenue: salesSummary._sum.total ?? 0,
         subtotal: salesSummary._sum.subtotal ?? 0,
         discount_total: salesSummary._sum.discount_total ?? 0,
+        tax_collected: salesSummary._sum.tax_amount ?? 0,
+        service_charge_collected: salesSummary._sum.service_charge_amount ?? 0,
         transaction_count: salesSummary._count.id,
         cogs_total: cogsSummary._sum.cogs_total ?? 0,
         gross_profit: Number(salesSummary._sum.total ?? 0) - Number(cogsSummary._sum.cogs_total ?? 0),
@@ -114,7 +115,7 @@ export const getSalesSummary = async (req: Request, res: Response) => {
   }
 };
 
-// ─── Monthly report — for Indonesian tax report (Laporan Bulanan) ─────────────
+// ─── Monthly report — Indonesian tax report (Laporan Bulanan) ─────────────────
 
 export const getMonthlyReport = async (req: Request, res: Response) => {
   const { year, month } = req.query as Record<string, string>;
@@ -123,27 +124,29 @@ export const getMonthlyReport = async (req: Request, res: Response) => {
 
   const from = new Date(y, m - 1, 1);
   const to = new Date(y, m, 1);
+  const yearStart = new Date(y, 0, 1);
 
   try {
-    const [summary, cogsSummary, dailyBreakdown, paymentBreakdown] = await Promise.all([
+    const paidWhere = { created_at: { gte: from, lt: to }, status: 'PAID' as const };
+
+    const [summary, cogsSummary, dailyBreakdown, paymentBreakdown, ytdResult, expenseSum] = await Promise.all([
       prisma.transaction.aggregate({
-        _sum: { total: true, subtotal: true, discount_total: true },
+        _sum: { total: true, subtotal: true, discount_total: true, tax_amount: true, service_charge_amount: true },
         _count: { id: true },
-        where: { created_at: { gte: from, lt: to } },
+        where: paidWhere,
       }),
 
       prisma.transactionItem.aggregate({
         _sum: { cogs_total: true },
-        where: { transaction: { created_at: { gte: from, lt: to } } },
+        where: { transaction: paidWhere },
       }),
 
-      // Daily totals — used for the Laporan Penjualan Harian table
       prisma.$queryRaw<{ day: string; revenue: number; count: number }[]>`
         SELECT DATE(created_at) AS day,
                SUM(total)::float8 AS revenue,
                COUNT(*)::int AS count
         FROM transactions
-        WHERE created_at >= ${from} AND created_at < ${to}
+        WHERE created_at >= ${from} AND created_at < ${to} AND status = 'PAID'
         GROUP BY day
         ORDER BY day
       `,
@@ -152,29 +155,77 @@ export const getMonthlyReport = async (req: Request, res: Response) => {
         by: ['method'],
         _sum: { amount: true },
         _count: { id: true },
-        where: { transaction: { created_at: { gte: from, lt: to } } },
+        where: { transaction: paidWhere },
+      }),
+
+      // YTD gross revenue — for UMKM Rp 500M rule
+      prisma.transaction.aggregate({
+        _sum: { total: true },
+        where: { status: 'PAID', created_at: { gte: yearStart, lt: to } },
+      }),
+
+      // Monthly expenses total
+      prisma.expense.aggregate({
+        _sum: { amount: true },
+        where: { created_at: { gte: from, lt: to } },
       }),
     ]);
 
     const settings = await prisma.setting.findUnique({ where: { id: 'GLOBAL' } });
-    const taxConfig = settings?.tax_config as { is_pkp: boolean; ppn_rate: number; npwp?: string } | null;
+    const taxConfig = parseTaxConfig(settings?.tax_config);
 
-    const revenue = Number(summary._sum.total ?? 0);
-    const ppnRate = taxConfig?.ppn_rate ?? 11;
-    const ppnAmount = taxConfig?.is_pkp ? (revenue * ppnRate) / (100 + ppnRate) : 0;
+    const monthlyRevenue = Number(summary._sum.total ?? 0);
+    const ytdRevenue = Number(ytdResult._sum.total ?? 0);
+    const monthlyExpenses = Number(expenseSum._sum.amount ?? 0);
+    const cogsTotal = Number(cogsSummary._sum.cogs_total ?? 0);
+    const taxCollected = Number(summary._sum.tax_amount ?? 0);
+
+    // ── Tax Liability Calculation ───────────────────────────────────────
+    let taxLiability = 0;
+    let taxExplanation = '';
+
+    if (taxConfig.tax_status === 'FREE') {
+      taxLiability = 0;
+      taxExplanation = 'UMKM with revenue below Rp 500M — no income tax liability.';
+    } else if (taxConfig.tax_status === 'PPH_FINAL') {
+      // PPh Final 0.5% applies ONLY to revenue exceeding the first Rp 500M of the year
+      // Calculate how much of this month's revenue falls above the 500M threshold
+      const ytdBeforeThisMonth = ytdRevenue - monthlyRevenue;
+      const alreadyExempt = Math.min(ytdBeforeThisMonth, UMKM_TAX_FREE_LIMIT);
+      const remainingExemption = Math.max(0, UMKM_TAX_FREE_LIMIT - alreadyExempt);
+      const taxableRevenue = Math.max(0, monthlyRevenue - remainingExemption);
+
+      taxLiability = Math.round(taxableRevenue * (taxConfig.pph_rate / 100));
+      taxExplanation = `PPh Final ${taxConfig.pph_rate}% on Rp ${taxableRevenue.toLocaleString('id-ID')} taxable revenue this month. Pay by the 15th of next month.`;
+    } else if (taxConfig.tax_status === 'PKP') {
+      // PKP: PPN collected is the tax liability to remit
+      taxLiability = taxCollected;
+      taxExplanation = `PKP — Total PPN (Pajak Keluaran) collected to be remitted to the government.`;
+    }
 
     return res.json({
       period: { year: y, month: m, from: from.toISOString(), to: to.toISOString() },
       store: settings?.store_info ?? {},
-      tax: { is_pkp: taxConfig?.is_pkp ?? false, npwp: taxConfig?.npwp, ppn_rate: ppnRate, ppn_amount: ppnAmount },
+      tax: {
+        config: taxConfig,
+        ytd_revenue: ytdRevenue,
+        ytd_remaining_exemption: Math.max(0, UMKM_TAX_FREE_LIMIT - ytdRevenue),
+        ytd_progress_pct: Math.min(100, (ytdRevenue / UMKM_TAX_FREE_LIMIT) * 100),
+        monthly_tax_liability: taxLiability,
+        tax_explanation: taxExplanation,
+        ppn_collected: taxCollected,
+      },
       summary: {
-        revenue,
+        revenue: monthlyRevenue,
         subtotal: Number(summary._sum.subtotal ?? 0),
         discount_total: Number(summary._sum.discount_total ?? 0),
+        tax_collected: taxCollected,
+        service_charge_collected: Number(summary._sum.service_charge_amount ?? 0),
         transaction_count: summary._count.id,
-        dpp: taxConfig?.is_pkp ? revenue - ppnAmount : revenue, // Dasar Pengenaan Pajak
-        cogs_total: Number(cogsSummary._sum.cogs_total ?? 0),
-        gross_profit: revenue - Number(cogsSummary._sum.cogs_total ?? 0),
+        cogs_total: cogsTotal,
+        gross_profit: monthlyRevenue - cogsTotal,
+        expenses_total: monthlyExpenses,
+        net_profit: monthlyRevenue - cogsTotal - monthlyExpenses,
       },
       daily_breakdown: dailyBreakdown,
       payment_breakdown: paymentBreakdown,
@@ -222,7 +273,6 @@ export const getPriceChangeLogs = async (req: Request, res: Response) => {
 // ─── Low stock alerts ─────────────────────────────────────────────────────────
 
 export const getLowStockAlerts = async (req: Request, res: Response) => {
-  // Default threshold is 10, but the frontend can request a custom one (e.g., ?threshold=5)
   const threshold = Number(req.query.threshold) || 10;
 
   try {
@@ -235,7 +285,7 @@ export const getLowStockAlerts = async (req: Request, res: Response) => {
           select: { name: true, category: { select: { name: true } } }
         }
       },
-      orderBy: { stock: 'asc' } // Show lowest stock first
+      orderBy: { stock: 'asc' }
     });
 
     return res.json({
@@ -262,9 +312,9 @@ export const getEStatement = async (req: Request, res: Response) => {
   const { from, to } = getDateRange(req.query as Record<string, string>);
 
   try {
-    // 1. Fetch Sales Transactions for timeline
+    // 1. Fetch PAID Sales Transactions for timeline
     const sales = await prisma.transaction.findMany({
-      where: { created_at: { gte: from, lt: to } },
+      where: { created_at: { gte: from, lt: to }, status: 'PAID' },
       include: { items: true },
       orderBy: { created_at: 'asc' }
     });
@@ -276,27 +326,45 @@ export const getEStatement = async (req: Request, res: Response) => {
       orderBy: { created_at: 'asc' }
     });
 
-    // We can merge them into a standard ledger format
-    const ledger = [];
+    // 3. Fetch Expenses for timeline
+    const expenses = await prisma.expense.findMany({
+      where: { created_at: { gte: from, lt: to } },
+      include: { user: { select: { name: true } } },
+      orderBy: { created_at: 'asc' },
+    });
+
+    const ledger: Array<{
+      date: string;
+      type: string;
+      ref_id: string;
+      description: string;
+      debit: number;
+      credit: number;
+      profit: number | null;
+    }> = [];
 
     let totalSalesRevenue = 0;
     let totalCogs = 0;
     let totalPurchases = 0;
+    let totalExpenses = 0;
+    let totalTaxCollected = 0;
 
     for (const s of sales) {
       const cogs = s.items.reduce((sum, item) => sum + Number(item.cogs_total), 0);
       const rev = Number(s.total);
-      
+      const tax = Number(s.tax_amount);
+
       totalSalesRevenue += rev;
       totalCogs += cogs;
+      totalTaxCollected += tax;
 
       ledger.push({
         date: s.created_at.toISOString(),
         type: 'SALE',
         ref_id: s.id,
         description: `Sales Transaction`,
-        debit: rev,     // Money in from sale
-        credit: cogs,   // COGS represented here as an asset credit, but e-statement formats usually vary.
+        debit: rev,
+        credit: cogs,
         profit: rev - cogs,
       });
     }
@@ -311,15 +379,29 @@ export const getEStatement = async (req: Request, res: Response) => {
         ref_id: r.id,
         description: `Restock: ${r.variant.product.name} ${r.variant.name ? `(${r.variant.name})` : ''}`,
         debit: 0,
-        credit: value, // Money out to buy stock
+        credit: value,
         profit: null,
       });
     }
 
-    // Sort ledger by date true chronological
+    for (const e of expenses) {
+      totalExpenses += Number(e.amount);
+
+      ledger.push({
+        date: e.created_at.toISOString(),
+        type: 'EXPENSE',
+        ref_id: e.id,
+        description: `Expense [${e.category}]: ${e.description || 'No description'}`,
+        debit: 0,
+        credit: Number(e.amount),
+        profit: null,
+      });
+    }
+
+    // Sort ledger by date chronologically
     ledger.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
-    // 3. Current Inventory Valuation (Global Asset Value)
+    // 4. Current Inventory Valuation (Global Asset Value)
     const allBatches = await prisma.stockBatch.findMany({
       where: { remaining_qty: { gt: 0 } }
     });
@@ -333,7 +415,10 @@ export const getEStatement = async (req: Request, res: Response) => {
         total_cogs: totalCogs,
         gross_profit: totalSalesRevenue - totalCogs,
         total_purchases_spent: totalPurchases,
-        current_inventory_valuation: currentValuation
+        total_expenses: totalExpenses,
+        total_tax_collected: totalTaxCollected,
+        net_income: totalSalesRevenue - totalCogs - totalExpenses,
+        current_inventory_valuation: currentValuation,
       }
     });
   } catch (error) {
