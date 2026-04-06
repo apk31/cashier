@@ -112,6 +112,7 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
           });
 
           let qtyNeeded = item.quantity;
+          const clearedDetails: any[] = [];
 
           for (const batch of batches) {
             if (qtyNeeded <= 0) break;
@@ -119,6 +120,7 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
 
             cogsTotal += qtyToTake * Number(batch.base_price);
             qtyNeeded -= qtyToTake;
+            clearedDetails.push({ qty: qtyToTake, base_price: Number(batch.base_price) });
 
             await tx.stockBatch.update({
               where: { id: batch.id },
@@ -140,7 +142,8 @@ export const createTransaction = async (req: AuthRequest, res: Response) => {
             oldStock,
             newStock,
             StockReason.SALE,
-            `Transaction #${transactionId}`
+            `Transaction #${transactionId}`,
+            clearedDetails
           );
         }
 
@@ -340,7 +343,7 @@ export const getTransaction = async (req: AuthRequest, res: Response) => {
 // ─── Get all transactions (paginated) ─────────────────────────────────────────
 
 export const getTransactions = async (req: AuthRequest, res: Response) => {
-  const { page = '1', limit = '50', from, to, status } = req.query as Record<string, string>;
+  const { page = '1', limit = '50', from, to, status, shift_id } = req.query as Record<string, string>;
 
   const take = Math.min(parseInt(limit) || 50, 200);
   const skip = (Math.max(parseInt(page) || 1, 1) - 1) * take;
@@ -358,13 +361,19 @@ export const getTransactions = async (req: AuthRequest, res: Response) => {
     whereOptions.status = status as any;
   }
 
+  if (shift_id) {
+    whereOptions.shift_id = shift_id;
+  }
+
   try {
     const [transactions, total] = await Promise.all([
       prisma.transaction.findMany({
         where: whereOptions,
         include: {
           user: { select: { name: true } },
-          member: { select: { name: true } },
+          member: { select: { name: true, phone: true } },
+          payments: true,
+          items: { include: { variant: { include: { product: true } } } },
         },
         orderBy: { created_at: 'desc' },
         take,

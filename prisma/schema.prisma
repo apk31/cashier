@@ -110,7 +110,7 @@ model Variant {
   price          Decimal           @db.Decimal(12, 2)
   stock          Int               @default(0)
   has_open_price Boolean           @default(false)
-  product        Product           @relation(fields: [product_id], references: [id])
+  product        Product           @relation(fields: [product_id], references: [id], onDelete: Cascade)
   price_logs     PriceLog[]
   items          TransactionItem[]
   stock_logs     StockLog[]
@@ -128,7 +128,7 @@ model PriceLog {
   new_price  Decimal  @db.Decimal(12, 2)
   changed_by String   @db.Uuid
   created_at DateTime @default(now())
-  variant    Variant  @relation(fields: [variant_id], references: [id])
+  variant    Variant  @relation(fields: [variant_id], references: [id], onDelete: Cascade)
   user       User     @relation(fields: [changed_by], references: [id])
 
   @@index([variant_id])
@@ -145,8 +145,9 @@ model StockLog {
   change     Int // positive = stock added, negative = stock removed
   reason     StockReason
   note       String?
+  details    Json?
   created_at DateTime    @default(now())
-  variant    Variant     @relation(fields: [variant_id], references: [id])
+  variant    Variant     @relation(fields: [variant_id], references: [id], onDelete: Cascade)
   user       User        @relation(fields: [user_id], references: [id])
 
   @@index([variant_id])

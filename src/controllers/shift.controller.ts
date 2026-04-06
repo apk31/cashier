@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { uuidv7 } from 'uuidv7';
 import { prisma } from '../lib/prisma';
 import { AuthRequest } from '../middlewares/auth.middleware';
+import { Prisma } from '@prisma/client';
 
 // ─── Validation schemas ───────────────────────────────────────────────────────
 
@@ -101,6 +102,25 @@ export const closeShift = async (req: AuthRequest, res: Response) => {
       },
     });
 
+    // If there is a cash discrepancy, physically log it in the global transactions table!
+    if (difference !== 0) {
+      await prisma.transaction.create({
+        data: {
+          id: uuidv7(),
+          total: difference,
+          subtotal: difference,
+          tax_amount: 0,
+          discount_total: 0,
+          status: 'PAID',
+          user_id: userId,
+          shift_id: shiftId,
+          payments: {
+            create: [{ id: uuidv7(), method: 'CASH', amount: difference }]
+          }
+        }
+      });
+    }
+
     return res.json({
       ...updated,
       cash_from_sales: cashFromSales,
@@ -159,7 +179,7 @@ export const getShifts = async (req: AuthRequest, res: Response) => {
   if (status) where.status = status;
 
   try {
-    const [shifts, total] = await Promise.all([
+    const [rawShifts, total] = await Promise.all([
       prisma.cashShift.findMany({
         where,
         include: {
@@ -172,6 +192,27 @@ export const getShifts = async (req: AuthRequest, res: Response) => {
       }),
       prisma.cashShift.count({ where }),
     ]);
+
+    const shiftIds = rawShifts.map((s) => s.id);
+    const allPayments = await prisma.payment.findMany({
+      where: { transaction: { shift_id: { in: shiftIds }, status: 'PAID' } },
+      select: { amount: true, method: true, transaction: { select: { shift_id: true } } }
+    });
+
+    const shifts = rawShifts.map(shift => {
+      let cash = 0, qris = 0, transfer = 0;
+      for (const p of allPayments) {
+        if (p.transaction.shift_id === shift.id) {
+           if (p.method === 'CASH') cash += Number(p.amount);
+           else if (p.method === 'QRIS') qris += Number(p.amount);
+           else if (p.method === 'TRANSFER') transfer += Number(p.amount);
+        }
+      }
+      return {
+        ...shift,
+        breakdown: { cash, qris, transfer, total_sales: cash + qris + transfer }
+      };
+    });
 
     return res.json({ data: shifts, total, page: parseInt(page), limit: take });
   } catch (error) {

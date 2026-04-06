@@ -115,21 +115,20 @@ export const getSalesSummary = async (req: Request, res: Response) => {
   }
 };
 
-// ─── Monthly report — Indonesian tax report (Laporan Bulanan) ─────────────────
+// ─── Annual report — Indonesian tax report (Laporan Tahunan SPT) ─────────────────
 
 export const getMonthlyReport = async (req: Request, res: Response) => {
-  const { year, month } = req.query as Record<string, string>;
+  const { year } = req.query as Record<string, string>;
   const y = parseInt(year) || new Date().getFullYear();
-  const m = parseInt(month) || new Date().getMonth() + 1;
 
-  const from = new Date(y, m - 1, 1);
-  const to = new Date(y, m, 1);
-  const yearStart = new Date(y, 0, 1);
+  const from = new Date(y, 0, 1);
+  const to = new Date(y + 1, 0, 1);
+  const yearStart = from;
 
   try {
     const paidWhere = { created_at: { gte: from, lt: to }, status: 'PAID' as const };
 
-    const [summary, cogsSummary, dailyBreakdown, paymentBreakdown, ytdResult, expenseSum] = await Promise.all([
+    const [summary, cogsSummary, dailyBreakdown, paymentBreakdown, ytdResult, expenseSum, txHistory, activeBatches, monthlyBatches, adjustLogs] = await Promise.all([
       prisma.transaction.aggregate({
         _sum: { total: true, subtotal: true, discount_total: true, tax_amount: true, service_charge_amount: true },
         _count: { id: true },
@@ -169,6 +168,34 @@ export const getMonthlyReport = async (req: Request, res: Response) => {
         _sum: { amount: true },
         where: { created_at: { gte: from, lt: to } },
       }),
+
+      // Transaction history (sales) mapping
+      prisma.transaction.findMany({
+        where: paidWhere,
+        select: { id: true, created_at: true, total: true, tax_amount: true, items: { include: { variant: { include: { product: { select: { name: true } } } } } } },
+        orderBy: { created_at: 'asc' },
+      }),
+
+      // Active stock batches for valuation (held up to the selected year)
+      prisma.stockBatch.findMany({
+        where: { 
+          remaining_qty: { gt: 0 },
+          created_at: { lt: to }
+        },
+        include: { variant: { include: { product: { select: { name: true } } } } }
+      }),
+
+      // Monthly stock batches for transaction history mapping (Buys)
+      prisma.stockBatch.findMany({
+        where: { created_at: { gte: from, lt: to } },
+        include: { variant: { include: { product: { select: { name: true } } } } }
+      }),
+
+      // Stock adjustments for audit logging (lost/damaged stocks in SPT)
+      prisma.stockLog.findMany({
+        where: { created_at: { gte: from, lt: to }, reason: { notIn: ['SALE', 'RESTOCK'] } },
+        include: { variant: { include: { product: { select: { name: true } } } } }
+      })
     ]);
 
     const settings = await prisma.setting.findUnique({ where: { id: 'GLOBAL' } });
@@ -196,15 +223,94 @@ export const getMonthlyReport = async (req: Request, res: Response) => {
       const taxableRevenue = Math.max(0, monthlyRevenue - remainingExemption);
 
       taxLiability = Math.round(taxableRevenue * (taxConfig.pph_rate / 100));
-      taxExplanation = `PPh Final ${taxConfig.pph_rate}% on Rp ${taxableRevenue.toLocaleString('id-ID')} taxable revenue this month. Pay by the 15th of next month.`;
+      taxExplanation = `PPh Final ${taxConfig.pph_rate}% on Rp ${taxableRevenue.toLocaleString('id-ID')} taxable revenue this year.`;
     } else if (taxConfig.tax_status === 'PKP') {
       // PKP: PPN collected is the tax liability to remit
       taxLiability = taxCollected;
-      taxExplanation = `PKP — Total PPN (Pajak Keluaran) collected to be remitted to the government.`;
+      taxExplanation = `PKP — Total PPN (Pajak Keluaran) collected this year to be remitted to the government.`;
     }
 
+    // Map combined transaction history (Buys and Sells)
+    const transactionHistory = [];
+    
+    for (const tx of txHistory) {
+      const isSystemAdj = tx.items.length === 0;
+      const productNames = isSystemAdj ? (Number(tx.total) < 0 ? 'CASHUP SHORTAGE' : 'CASHUP OVERAGE') : Array.from(new Set(tx.items.map((i: any) => i.variant?.product?.name || 'Item'))).join(', ');
+      
+      transactionHistory.push({
+        date: tx.created_at.toISOString(),
+        product_name: productNames,
+        type: 'S',
+        qty: tx.items.reduce((sum: number, item: any) => sum + item.qty, 0),
+        price: 0,
+        buy_value: 0,
+        sell_value: Number(tx.total),
+        tax: Number(tx.tax_amount)
+      });
+    }
+
+    for (const b of monthlyBatches) {
+      transactionHistory.push({
+        date: b.created_at.toISOString(),
+        product_name: b.variant.product.name + (b.variant.name ? ` ${b.variant.name}` : ''),
+        type: 'B',
+        qty: b.initial_qty,
+        price: Number(b.base_price),
+        buy_value: b.initial_qty * Number(b.base_price),
+        sell_value: 0,
+        tax: 0
+      });
+    }
+
+    // Map adjustments
+    for (const log of adjustLogs) {
+      if (log.change === 0) continue;
+      
+      let basePriceTotal = 0;
+      let qtyTracked = 0;
+      
+      // If details exist, use them safely
+      const logData = log as any;
+      if (logData.details && Array.isArray(logData.details)) {
+         for (const d of logData.details) {
+            qtyTracked += Number(d.qty);
+            basePriceTotal += (Number(d.qty) * Number(d.base_price));
+         }
+      }
+
+      // Fallback base price if no details exist (legacy or skipped)
+      const effectiveQty = qtyTracked || Math.abs(log.change);
+      const effectiveBasePrice = basePriceTotal > 0 ? (basePriceTotal / effectiveQty) : 0;
+
+      // Apply the negative sign if log.change is negative so qty is strictly signed
+      const actualQty = log.change < 0 ? -Math.abs(effectiveQty) : Math.abs(effectiveQty);
+
+      transactionHistory.push({
+        date: log.created_at.toISOString(),
+        product_name: `[${log.reason}] ${log.variant.product.name}` + (log.variant.name ? ` ${log.variant.name}` : ''),
+        type: log.change > 0 ? 'A (In)' : 'A (Out)', // Explicit direction
+        qty: actualQty,
+        price: effectiveBasePrice,
+        buy_value: log.change < 0 ? -basePriceTotal : basePriceTotal,
+        sell_value: 0,
+        tax: 0
+      });
+    }
+
+    // Chronological sort
+    transactionHistory.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+    // Map inventory valuation (separate by batches as requested)
+    const inventoryValuation = activeBatches.map(batch => ({
+      sku: batch.variant.sku,
+      product_name: batch.variant.product.name + (batch.variant.name ? ` - ${batch.variant.name}` : ''),
+      qty: batch.remaining_qty,
+      base_price: Number(batch.base_price),
+      valuation: batch.remaining_qty * Number(batch.base_price)
+    })).sort((a: any, b: any) => b.valuation - a.valuation);
+
     return res.json({
-      period: { year: y, month: m, from: from.toISOString(), to: to.toISOString() },
+      period: { year: y, from: from.toISOString(), to: to.toISOString() },
       store: settings?.store_info ?? {},
       tax: {
         config: taxConfig,
@@ -229,6 +335,8 @@ export const getMonthlyReport = async (req: Request, res: Response) => {
       },
       daily_breakdown: dailyBreakdown,
       payment_breakdown: paymentBreakdown,
+      inventory_valuation: inventoryValuation,
+      transaction_history: transactionHistory,
     });
   } catch (error) {
     console.error('[report.monthly]', error);
@@ -326,6 +434,13 @@ export const getEStatement = async (req: Request, res: Response) => {
       orderBy: { created_at: 'asc' }
     });
 
+    // Fetch Stock Deductions (Losses/Damages) for timeline
+    const deductions = await prisma.stockLog.findMany({
+      where: { created_at: { gte: from, lt: to }, change: { lt: 0 }, reason: { in: ['DAMAGE', 'ADJUSTMENT', 'RETURN'] } },
+      include: { variant: { include: { product: true } } },
+      orderBy: { created_at: 'asc' }
+    });
+
     // 3. Fetch Expenses for timeline
     const expenses = await prisma.expense.findMany({
       where: { created_at: { gte: from, lt: to } },
@@ -350,6 +465,36 @@ export const getEStatement = async (req: Request, res: Response) => {
     let totalTaxCollected = 0;
 
     for (const s of sales) {
+      if (s.items.length === 0) {
+        // System Cashup Discrepancy
+        const val = Number(s.total);
+        if (val < 0) {
+          const loss = Math.abs(val);
+          totalExpenses += loss;
+          ledger.push({
+            date: s.created_at.toISOString(),
+            type: 'SHORTAGE',
+            ref_id: s.id,
+            description: `Cashup Shortage (Missing Cash)`,
+            debit: 0,
+            credit: loss,
+            profit: -loss,
+          });
+        } else {
+          totalSalesRevenue += val;
+          ledger.push({
+            date: s.created_at.toISOString(),
+            type: 'OVERAGE',
+            ref_id: s.id,
+            description: `Cashup Overage (Surplus Cash)`,
+            debit: val,
+            credit: 0,
+            profit: val,
+          });
+        }
+        continue;
+      }
+
       const cogs = s.items.reduce((sum, item) => sum + Number(item.cogs_total), 0);
       const rev = Number(s.total);
       const tax = Number(s.tax_amount);
@@ -382,6 +527,28 @@ export const getEStatement = async (req: Request, res: Response) => {
         credit: value,
         profit: null,
       });
+    }
+
+    for (const d of deductions) {
+      let lossValue = 0;
+      const logData = d as any;
+      if (logData.details && Array.isArray(logData.details)) {
+        for (const det of logData.details) {
+          lossValue += Number(det.qty) * Number(det.base_price);
+        }
+      }
+      if (lossValue > 0) {
+        totalExpenses += lossValue;
+        ledger.push({
+          date: d.created_at.toISOString(),
+          type: 'LOSS',
+          ref_id: d.id,
+          description: `Stock Adjusted (Lost) [${d.reason}]: ${d.variant.product.name}`,
+          debit: 0,
+          credit: lossValue,
+          profit: -lossValue,
+        });
+      }
     }
 
     for (const e of expenses) {

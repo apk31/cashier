@@ -82,7 +82,7 @@ const updateStockSchema = z.object({
 export const getProducts = async (req: AuthRequest, res: Response) => {
   const { q, category_id, page = '1', limit = '50' } = req.query as Record<string, string>
 
-  const take = Math.min(parseInt(limit) || 50, 200)
+  const take = Math.min(parseInt(limit) || 50, 2000)
   const skip = (Math.max(parseInt(page) || 1, 1) - 1) * take
 
   try {
@@ -148,9 +148,15 @@ export const createProduct = async (req: AuthRequest, res: Response) => {
 
   try {
     const result = await prisma.$transaction(async (tx) => {
-      const product = await tx.product.create({
-        data: { id: uuidv7(), name, category_id },
+      let product = await tx.product.findFirst({
+        where: { name, category_id }
       })
+
+      if (!product) {
+        product = await tx.product.create({
+          data: { id: uuidv7(), name, category_id },
+        })
+      }
 
       const createdVariants = await Promise.all(
         variants.map(async (v) => {
@@ -182,7 +188,8 @@ export const createProduct = async (req: AuthRequest, res: Response) => {
               tx, variant.id, userId,
               0, v.stock,
               StockReason.RESTOCK,
-              'Initial stock on product creation'
+              'Initial stock on product creation',
+              [{ qty: v.stock, base_price: Number(v.base_price) }]
             )
           }
 
@@ -284,6 +291,7 @@ export const updateVariantStock = async (req: AuthRequest, res: Response) => {
 
       const oldStock = variant.stock
       const newStock = oldStock + quantity
+      const details: any[] = []
 
       if (newStock < 0) throw new Error(`Stock cannot go negative. Current stock: ${oldStock}`)
 
@@ -298,6 +306,7 @@ export const updateVariantStock = async (req: AuthRequest, res: Response) => {
             base_price: parsed.data.base_price,
           }
         });
+        details.push({ qty: quantity, base_price: Number(parsed.data.base_price) });
       } else if (quantity < 0) {
         // Remove from oldest FIFO queue
         const batches = await tx.stockBatch.findMany({
@@ -309,6 +318,7 @@ export const updateVariantStock = async (req: AuthRequest, res: Response) => {
            if (qtyToDrop <= 0) break;
            const taking = Math.min(batch.remaining_qty, qtyToDrop);
            qtyToDrop -= taking;
+           details.push({ qty: taking, base_price: Number(batch.base_price) });
            await tx.stockBatch.update({
              where: { id: batch.id },
              data: { remaining_qty: batch.remaining_qty - taking }
@@ -321,7 +331,7 @@ export const updateVariantStock = async (req: AuthRequest, res: Response) => {
         data: { stock: newStock },
       })
 
-      await logStockChange(tx, id, userId, oldStock, newStock, reason, note)
+      await logStockChange(tx, id, userId, oldStock, newStock, reason, note, details)
 
       return updated
     })
@@ -483,10 +493,12 @@ export const applyProductsBulk = async (req: AuthRequest, res: Response) => {
 
           if (needsStockLog) {
             const diff = row.stock - oldStock;
+            const details: any[] = [];
             if (diff > 0) {
                await tx.stockBatch.create({
                  data: { id: uuidv7(), variant_id: existingVariant.id, initial_qty: diff, remaining_qty: diff, base_price: row.base_price }
                });
+               details.push({ qty: diff, base_price: Number(row.base_price) });
             } else if (diff < 0) {
                const batches = await tx.stockBatch.findMany({
                  where: { variant_id: existingVariant.id, remaining_qty: { gt: 0 } },
@@ -497,13 +509,14 @@ export const applyProductsBulk = async (req: AuthRequest, res: Response) => {
                   if (qtyToDrop <= 0) break;
                   const taking = Math.min(batch.remaining_qty, qtyToDrop);
                   qtyToDrop -= taking;
+                  details.push({ qty: taking, base_price: Number(batch.base_price) });
                   await tx.stockBatch.update({
                     where: { id: batch.id },
                     data: { remaining_qty: batch.remaining_qty - taking }
                   });
                }
             }
-            await logStockChange(tx, existingVariant.id, userId, oldStock, row.stock, StockReason.ADJUSTMENT, 'Bulk Import Update');
+            await logStockChange(tx, existingVariant.id, userId, oldStock, row.stock, StockReason.ADJUSTMENT, 'Bulk Import Update', details);
           }
 
           updatedCount++;

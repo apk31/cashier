@@ -18,7 +18,8 @@ export const logStockChange = async (
   oldStock: number,
   newStock: number,
   reason: StockReason,
-  note?: string
+  note?: string,
+  details?: any
 ) => {
   return tx.stockLog.create({
     data: {
@@ -30,6 +31,7 @@ export const logStockChange = async (
       change: newStock - oldStock,
       reason,
       note: note ?? null,
+      details: details ?? null,
     },
   })
 }
